@@ -10,8 +10,14 @@ class Scheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.use_state_cache = config.use_state_cache
+        self.rwkv_prefill_max_batch_size = config.rwkv_prefill_max_batch_size
+        self.rwkv_prefill_token_budget = config.rwkv_prefill_token_budget
         self.eos = config.eos
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        if config.use_state_cache:
+            self.block_manager = BlockManager(config.num_state_blocks, 1, one_block_per_seq=True)
+        else:
+            self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -26,13 +32,25 @@ class Scheduler:
         scheduled_seqs = []
         num_seqs = 0
         num_batched_tokens = 0
+        prefill_max_num_seqs = self.max_num_seqs
+        prefill_max_batched_tokens = self.max_num_batched_tokens
+        if self.use_state_cache:
+            prefill_max_num_seqs = min(prefill_max_num_seqs, self.rwkv_prefill_max_batch_size)
+            prefill_max_batched_tokens = min(prefill_max_batched_tokens, self.rwkv_prefill_token_budget)
         while self.waiting and num_seqs < self.max_num_seqs:
             seq = self.waiting[0]
-            if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
+            num_new_tokens = len(seq) - seq.num_cached_tokens
+            if self.use_state_cache and scheduled_seqs:
+                if num_seqs >= prefill_max_num_seqs or num_batched_tokens + num_new_tokens > prefill_max_batched_tokens:
+                    break
+            elif self.use_state_cache and not scheduled_seqs:
+                if num_new_tokens <= prefill_max_batched_tokens and num_seqs >= prefill_max_num_seqs:
+                    break
+            if num_batched_tokens + num_new_tokens > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
                 break
             num_seqs += 1
             self.block_manager.allocate(seq)
-            num_batched_tokens += len(seq) - seq.num_cached_tokens
+            num_batched_tokens += num_new_tokens
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
             self.running.append(seq)

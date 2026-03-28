@@ -3,9 +3,27 @@ from torch import nn
 import triton
 import triton.language as tl
 
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
 
+# Lazy import flash_attn to allow RWKV models to work without it
+# _flash_attn_available = None
+# def _get_flash_attn():
+#     global _flash_attn_available
+#     if _flash_attn_available is None:
+#         try:
+#             from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+#             _flash_attn_available = (flash_attn_varlen_func, flash_attn_with_kvcache)
+#         except ImportError:
+#             _flash_attn_available = False
+#     if _flash_attn_available is False:
+#         raise ImportError("flash_attn is required for this model but not installed")
+#     return _flash_attn_available
+
+try:
+    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+except ImportError:
+    flash_attn_varlen_func = None
+    flash_attn_with_kvcache = None
 
 @triton.jit
 def store_kvcache_kernel(
@@ -61,6 +79,7 @@ class Attention(nn.Module):
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+        assert flash_attn_varlen_func is not None and flash_attn_with_kvcache is not None
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache

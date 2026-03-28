@@ -6,6 +6,18 @@ import torch.distributed as dist
 from nanovllm.utils.context import get_context
 
 
+@torch.jit.ignore
+def _all_reduce_(x: torch.Tensor):
+    dist.all_reduce(x)
+
+
+@torch.jit.ignore
+def _gather_logits(logits: torch.Tensor, tp_size: int, tp_rank: int):
+    all_logits = [torch.empty_like(logits) for _ in range(tp_size)] if tp_rank == 0 else None
+    dist.gather(logits, all_logits, 0)
+    return torch.cat(all_logits, -1) if tp_rank == 0 else None
+
+
 class VocabParallelEmbedding(nn.Module):
 
     def __init__(
@@ -32,13 +44,13 @@ class VocabParallelEmbedding(nn.Module):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):
-        if self.tp_size > 1:
-            mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
-            x = mask * (x - self.vocab_start_idx)
+        if self.tp_size == 1:
+            return F.embedding(x, self.weight)
+        mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
+        x = mask * (x - self.vocab_start_idx)
         y = F.embedding(x, self.weight)
-        if self.tp_size > 1:
-            y = mask.unsqueeze(1) * y
-            dist.all_reduce(y)
+        y = mask.unsqueeze(1) * y
+        _all_reduce_(y)
         return y
 
 
@@ -54,13 +66,16 @@ class ParallelLMHead(VocabParallelEmbedding):
         super().__init__(num_embeddings, embedding_dim)
 
     def forward(self, x: torch.Tensor):
+        if self.tp_size == 1 and x.dim() == 2:
+            return F.linear(x, self.weight)
         context = get_context()
         if context.is_prefill:
-            last_indices = context.cu_seqlens_q[1:] - 1
-            x = x[last_indices].contiguous()
+            if x.dim() == 3:
+                x = x[:, -1, :].contiguous()
+            else:
+                last_indices = context.cu_seqlens_q[1:] - 1
+                x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
-            all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
-            dist.gather(logits, all_logits, 0)
-            logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
+            logits = _gather_logits(logits, self.tp_size, self.tp_rank)
         return logits

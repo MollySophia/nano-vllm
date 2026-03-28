@@ -1,4 +1,5 @@
 import pickle
+import gc
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -7,6 +8,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.rwkv7 import RWKV7ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -18,21 +20,48 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
+        self.use_state_cache = config.use_state_cache
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
 
+        if self.use_state_cache:
+            # Handle both torch.dtype and string representations
+            dtype = hf_config.torch_dtype
+            if isinstance(dtype, str):
+                assert dtype == "float16" or dtype == "torch.float16"
+            else:
+                assert dtype == torch.float16
+
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)
-        torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        # Handle torch_dtype that might be a string
+        dtype = hf_config.torch_dtype
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype.replace("torch.", ""))
+        torch.set_default_dtype(dtype)
+        if self.use_state_cache:
+            # RWKV replaces most large parameter storages during load_pth().
+            # Build the module skeleton on CPU to avoid preallocating dead CUDA buffers.
+            torch.set_default_device("cpu")
+            self.model = RWKV7ForCausalLM(hf_config)
+            torch.set_default_device("cuda")
+        else:
+            torch.set_default_device("cuda")
+            self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
-        self.warmup_model()
-        self.allocate_kv_cache()
+        # Allocate cache before warmup for RWKV (state cache is required for forward)
+        if self.use_state_cache:
+            self.allocate_state_cache()
+        else:
+            self.warmup_model()
+            self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -55,7 +84,12 @@ class ModelRunner:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
+        for attr in ("state_cache", "token_shift_cache", "kv_cache", "model", "sampler"):
+            if hasattr(self, attr):
+                delattr(self, attr)
         torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
         dist.destroy_process_group()
 
     def loop(self):
@@ -117,6 +151,95 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
+    def allocate_state_cache(self):
+        config = self.config
+        hf_config = config.hf_config
+        num_heads = hf_config.num_heads // self.world_size
+        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_heads)
+        block_bytes = hf_config.num_hidden_layers * (head_dim + 2) * num_heads * head_dim * hf_config.torch_dtype.itemsize
+        prefill_probe_bytes = self.measure_state_prefill_probe_bytes(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            batch_size=1,
+            prompt_len=config.rwkv_prefill_token_budget,
+        )
+
+        def compute_num_state_blocks():
+            free, total = torch.cuda.mem_get_info()
+            reserve = total * (1 - config.gpu_memory_utilization)
+            available = free - reserve - prefill_probe_bytes
+            return int(available) // block_bytes
+
+        config.num_state_blocks = compute_num_state_blocks()
+        if config.num_state_blocks <= 0:
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            config.num_state_blocks = compute_num_state_blocks()
+        if config.num_state_blocks <= 0:
+            raise RuntimeError(
+                f"Unable to allocate RWKV state cache: computed num_state_blocks={config.num_state_blocks}. "
+                "Try lowering model memory pressure or increasing gpu_memory_utilization."
+            )
+        self.state_cache = torch.zeros(hf_config.num_hidden_layers, config.num_state_blocks, num_heads, head_dim, head_dim)
+        self.token_shift_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_state_blocks, hf_config.hidden_size)
+        self.bind_state_cache_modules(self.state_cache, self.token_shift_cache)
+
+    def bind_state_cache_modules(self, state_cache: torch.Tensor, token_shift_cache: torch.Tensor):
+        # Use sets to track which layers have been assigned
+        att_assigned = set()
+        ffn_assigned = set()
+        for name, module in self.model.named_modules():
+            # Try to get layer_id from layer_idx attribute or parse from module name
+            layer_id = None
+            if hasattr(module, "layer_idx"):
+                layer_id = module.layer_idx
+            else:
+                # Parse from name like "blocks.0.att" or "model.blocks.5.ffn"
+                import re
+                match = re.search(r'\.blocks?\.(\d+)\.', name)
+                if match:
+                    layer_id = int(match.group(1))
+
+            if layer_id is not None:
+                if hasattr(module, "att_tokenshift_cache") and hasattr(module, "state_cache"):
+                    if layer_id not in att_assigned:
+                        module.att_tokenshift_cache = token_shift_cache[0, layer_id]
+                        module.state_cache = state_cache[layer_id]
+                        att_assigned.add(layer_id)
+                if hasattr(module, "ffn_tokenshift_cache"):
+                    if layer_id not in ffn_assigned:
+                        module.ffn_tokenshift_cache = token_shift_cache[1, layer_id]
+                        ffn_assigned.add(layer_id)
+
+    def measure_state_prefill_probe_bytes(self, num_heads: int, head_dim: int, batch_size: int, prompt_len: int) -> int:
+        hf_config = self.config.hf_config
+        probe_state_cache = torch.zeros(hf_config.num_hidden_layers, batch_size, num_heads, head_dim, head_dim)
+        probe_token_shift_cache = torch.zeros(2, hf_config.num_hidden_layers, batch_size, hf_config.hidden_size)
+        self.bind_state_cache_modules(probe_state_cache, probe_token_shift_cache)
+
+        seqs = []
+        for block_id in range(batch_size):
+            seq = Sequence([0] * prompt_len)
+            seq.block_table = [block_id]
+            seqs.append(seq)
+        input_ids, positions = self.prepare_prefill(seqs)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base_alloc = torch.cuda.memory_allocated()
+        _ = self.run_model(input_ids, positions, True)
+        torch.cuda.synchronize()
+        peak_alloc = torch.cuda.max_memory_allocated()
+        reset_context()
+
+        del input_ids, positions
+        del probe_state_cache, probe_token_shift_cache
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        return max(0, peak_alloc - base_alloc)
+
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
@@ -124,6 +247,32 @@ class ModelRunner:
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
+        if self.use_state_cache:
+            input_rows = []
+            position_rows = []
+            slot_mapping_in = []
+            slot_mapping_out = []
+            context_lens = []
+            max_seqlen = max(len(seq) - seq.num_cached_tokens for seq in seqs)
+            for seq in seqs:
+                new_token_ids = seq[seq.num_cached_tokens:]
+                seqlen = len(new_token_ids)
+                pad_len = max_seqlen - seqlen
+                input_rows.append([0] * pad_len + new_token_ids)
+                position_rows.append([0] * pad_len + list(range(seqlen)))
+                context_lens.append(seqlen)
+                # Warmup may bypass scheduler allocation.
+                block_id = seq.block_table[0] if seq.block_table else 0
+                slot_mapping_in.append(block_id)
+                slot_mapping_out.append(block_id)
+            input_ids = torch.tensor(input_rows, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            positions = torch.tensor(position_rows, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            slot_mapping_in = torch.tensor(slot_mapping_in, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            slot_mapping_out = torch.tensor(slot_mapping_out, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            set_context(True, slot_mapping_in=slot_mapping_in, slot_mapping_out=slot_mapping_out, context_lens=context_lens)
+            return input_ids, positions
+
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -162,6 +311,27 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        if self.use_state_cache:
+            input_ids = []
+            positions = []
+            slot_mapping_in = []
+            slot_mapping_out = []
+            context_lens = []
+            for seq in seqs:
+                input_ids.append(seq.last_token)
+                positions.append(len(seq) - 1)
+                context_lens.append(len(seq))
+                block_id = seq.block_table[0]
+                slot_mapping_in.append(block_id)
+                slot_mapping_out.append(block_id)
+            input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            slot_mapping_in = torch.tensor(slot_mapping_in, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            slot_mapping_out = torch.tensor(slot_mapping_out, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            set_context(False, context_lens=context_lens, slot_mapping_in=slot_mapping_in, slot_mapping_out=slot_mapping_out)
+            return input_ids, positions
+
         input_ids = []
         positions = []
         slot_mapping = []
@@ -188,6 +358,8 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        if self.use_state_cache:
+            return self.model.forward_logits(input_ids, positions)
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
@@ -215,6 +387,8 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        if self.use_state_cache:
+            return
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)

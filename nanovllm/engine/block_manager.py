@@ -25,8 +25,9 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int, one_block_per_seq: bool = False):
         self.block_size = block_size
+        self.one_block_per_seq = one_block_per_seq
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
@@ -54,10 +55,17 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> bool:
+        if self.one_block_per_seq:
+            return len(self.free_block_ids) > 0
         return len(self.free_block_ids) >= seq.num_blocks
 
     def allocate(self, seq: Sequence):
         assert not seq.block_table
+        if self.one_block_per_seq:
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            seq.block_table.append(block_id)
+            return
         h = -1
         cache_miss = False
         for i in range(seq.num_blocks):
@@ -91,9 +99,13 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
+        if self.one_block_per_seq:
+            return True
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
+        if self.one_block_per_seq:
+            return
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1:

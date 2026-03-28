@@ -10,6 +10,13 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 
 
 def load_model(model: nn.Module, path: str):
+    # Check for RWKV pth file first
+    pth_files = glob(os.path.join(path, "*.pth"))
+    if pth_files and hasattr(model, "load_pth"):
+        # Use model-specific pth loading (e.g., for RWKV)
+        model.load_pth(pth_files[0])
+        return
+
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:

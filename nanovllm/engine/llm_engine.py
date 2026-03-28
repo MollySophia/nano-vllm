@@ -15,6 +15,7 @@ from nanovllm.engine.model_runner import ModelRunner
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
+        self._exited = False
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
@@ -28,19 +29,30 @@ class LLMEngine:
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        config.eos = self.tokenizer.eos_token_id
+        # RWKV state-cache models typically don't ship a HF tokenizer config.
+        if config.use_state_cache:
+            self.tokenizer = None
+            config.eos = getattr(config.hf_config, 'eos_token_id', 0)
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+            config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 
     def exit(self):
-        self.model_runner.call("exit")
-        del self.model_runner
+        if self._exited:
+            return
+        self._exited = True
+        if hasattr(self, "model_runner"):
+            self.model_runner.call("exit")
+            del self.model_runner
         for p in self.ps:
             p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
+            if self.tokenizer is None:
+                raise ValueError("String prompts require a tokenizer. For RWKV pth models, please pass token ids (list[int]).")
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
@@ -87,7 +99,10 @@ class LLMEngine:
                 if use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        if self.tokenizer is not None:
+            outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        else:
+            outputs = [{"text": "", "token_ids": token_ids} for token_ids in outputs]
         if use_tqdm:
             pbar.close()
         return outputs
