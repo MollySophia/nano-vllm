@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.layers.linear import Int8MatmulLinear, MarlinInt8Linear, _int8_matmul, _int8_per_channel_cublas
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.rwkv7 import RWKV7ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -50,6 +51,9 @@ class ModelRunner:
             # Build the module skeleton on CPU to avoid preallocating dead CUDA buffers.
             torch.set_default_device("cpu")
             self.model = RWKV7ForCausalLM(hf_config)
+            # RWKV post-load quantization and sizing need runtime config knobs
+            # (e.g. rwkv_int8_*), not just the HF model config.
+            self.model.config = config
             torch.set_default_device("cuda")
         else:
             torch.set_default_device("cuda")
@@ -77,20 +81,55 @@ class ModelRunner:
                 self.loop()
 
     def exit(self):
-        if self.world_size > 1:
-            self.shm.close()
-            dist.barrier()
-            if self.rank == 0:
-                self.shm.unlink()
-        if not self.enforce_eager:
-            del self.graphs, self.graph_pool
-        for attr in ("state_cache", "token_shift_cache", "kv_cache", "model", "sampler"):
-            if hasattr(self, attr):
-                delattr(self, attr)
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-        dist.destroy_process_group()
+        try:
+            if self.world_size > 1 and hasattr(self, "shm"):
+                try:
+                    self.shm.close()
+                except Exception:
+                    pass
+                if dist.is_available() and dist.is_initialized():
+                    try:
+                        dist.barrier()
+                    except Exception:
+                        pass
+                if self.rank == 0:
+                    try:
+                        self.shm.unlink()
+                    except Exception:
+                        pass
+
+            if not self.enforce_eager:
+                for attr in ("graphs", "graph_pool"):
+                    if hasattr(self, attr):
+                        try:
+                            delattr(self, attr)
+                        except Exception:
+                            pass
+
+            for attr in ("state_cache", "token_shift_cache", "kv_cache", "model", "sampler"):
+                if hasattr(self, attr):
+                    try:
+                        delattr(self, attr)
+                    except Exception:
+                        pass
+
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+            gc.collect()
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+        finally:
+            if dist.is_available() and dist.is_initialized():
+                try:
+                    dist.destroy_process_group()
+                except Exception:
+                    pass
 
     def loop(self):
         while True:
@@ -157,6 +196,7 @@ class ModelRunner:
         num_heads = hf_config.num_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_heads)
         block_bytes = hf_config.num_hidden_layers * (head_dim + 2) * num_heads * head_dim * hf_config.torch_dtype.itemsize
+        self.warmup_int8_kernels()
         prefill_probe_bytes = self.measure_state_prefill_probe_bytes(
             num_heads=num_heads,
             head_dim=head_dim,
@@ -184,6 +224,42 @@ class ModelRunner:
         self.state_cache = torch.zeros(hf_config.num_hidden_layers, config.num_state_blocks, num_heads, head_dim, head_dim)
         self.token_shift_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_state_blocks, hf_config.hidden_size)
         self.bind_state_cache_modules(self.state_cache, self.token_shift_cache)
+        target_model = getattr(self.model, "model", self.model)
+        if hasattr(target_model, "decode_tokenshift_scratch"):
+            target_model.decode_tokenshift_scratch = torch.empty(
+                config.max_num_seqs,
+                hf_config.hidden_size,
+                dtype=hf_config.torch_dtype,
+                device=self.state_cache.device,
+            )
+
+    def warmup_int8_kernels(self):
+        if not self.use_state_cache or not torch.cuda.is_available():
+            return
+        dtype = self.config.hf_config.torch_dtype
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype.replace("torch.", ""))
+        warmed = False
+        with torch.no_grad():
+            for module in self.model.modules():
+                if isinstance(module, Int8MatmulLinear):
+                    x = torch.zeros((1, module.input_size), device=module.qweight.device, dtype=dtype)
+                    _ = _int8_matmul(x, module.qweight, module.scales, module.group_size, module.bias)
+                    warmed = True
+                elif isinstance(module, MarlinInt8Linear):
+                    x = torch.zeros((1, module.input_size), device=module.qweight.device, dtype=dtype)
+                    _ = module(x)
+                    warmed = True
+            lm_head = getattr(self.model, "lm_head", None)
+            if lm_head is not None and getattr(lm_head, "use_int8", False):
+                in_features = lm_head.qweight.shape[1]
+                x = torch.zeros((1, in_features), device=lm_head.qweight.device, dtype=dtype)
+                _ = _int8_per_channel_cublas(x, lm_head.qweight, lm_head.scales, lm_head.scales_fp16, None)
+                warmed = True
+        if warmed:
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def bind_state_cache_modules(self, state_cache: torch.Tensor, token_shift_cache: torch.Tensor):
         # Use sets to track which layers have been assigned

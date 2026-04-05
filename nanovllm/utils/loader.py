@@ -11,11 +11,17 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 
 def load_model(model: nn.Module, path: str):
     # Check for RWKV pth file first
-    pth_files = glob(os.path.join(path, "*.pth"))
+    if os.path.isfile(path) and path.endswith(".pth"):
+        pth_files = [path]
+    else:
+        pth_files = glob(os.path.join(path, "*.pth"))
     if pth_files and hasattr(model, "load_pth"):
         # Use model-specific pth loading (e.g., for RWKV)
         model.load_pth(pth_files[0])
         return
+
+    if os.path.isfile(path):
+        raise ValueError(f"Unsupported model file path: {path}")
 
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     for file in glob(os.path.join(path, "*.safetensors")):

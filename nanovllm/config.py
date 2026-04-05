@@ -11,6 +11,7 @@ class Config:
     max_model_len: int = 4096
     rwkv_prefill_token_budget: int = 2048
     rwkv_prefill_max_batch_size: int = 128
+    rwkv_quant_int8: bool = False
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
@@ -22,14 +23,17 @@ class Config:
     use_state_cache: bool = False
 
     def __post_init__(self):
-        assert os.path.isdir(self.model)
+        assert os.path.isdir(self.model) or (os.path.isfile(self.model) and self.model.endswith(".pth"))
         assert 1 <= self.tensor_parallel_size <= 8
         assert self.rwkv_prefill_token_budget > 0
         default_gpu_memory_utilization = type(self).gpu_memory_utilization
 
         # Check for RWKV pth file
         import glob
-        pth_files = glob.glob(os.path.join(self.model, "*.pth"))
+        if os.path.isfile(self.model) and self.model.endswith(".pth"):
+            pth_files = [self.model]
+        else:
+            pth_files = glob.glob(os.path.join(self.model, "*.pth"))
         if pth_files:
             # RWKV model - create config from pth filename
             self.use_state_cache = True
