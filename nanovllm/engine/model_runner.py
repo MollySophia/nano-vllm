@@ -7,7 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.layers.linear import Int8MatmulLinear, MarlinInt8Linear, _int8_matmul, _int8_per_channel_cublas
+from nanovllm.layers.linear import MarlinInt8Linear, _int8_per_channel_cublas
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.rwkv7 import RWKV7ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -242,11 +242,7 @@ class ModelRunner:
         warmed = False
         with torch.no_grad():
             for module in self.model.modules():
-                if isinstance(module, Int8MatmulLinear):
-                    x = torch.zeros((1, module.input_size), device=module.qweight.device, dtype=dtype)
-                    _ = _int8_matmul(x, module.qweight, module.scales, module.group_size, module.bias)
-                    warmed = True
-                elif isinstance(module, MarlinInt8Linear):
+                if isinstance(module, MarlinInt8Linear):
                     x = torch.zeros((1, module.input_size), device=module.qweight.device, dtype=dtype)
                     _ = module(x)
                     warmed = True

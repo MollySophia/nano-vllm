@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanovllm.layers.layernorm import LayerNorm
-from nanovllm.layers.linear import RowParallelLinear, ColumnParallelLinear, MatmulLinear, Int8MatmulLinear, MarlinInt8Linear, _int8_matmul, get_marlin_impl_or_raise
+from nanovllm.layers.linear import RowParallelLinear, ColumnParallelLinear, MatmulLinear, MarlinInt8Linear, get_marlin_impl_or_raise
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.utils.context import get_context
 from nanovllm.ops.rwkv7_cuda import (
@@ -59,9 +59,6 @@ def _linear_dispatch(
 ):
     if isinstance(proj_or_weight, torch.Tensor):
         return _matmul_linear(x, proj_or_weight, bias=bias)
-    if isinstance(proj_or_weight, Int8MatmulLinear):
-        proj_bias = bias if bias is not None else proj_or_weight.bias
-        return _int8_matmul(x, proj_or_weight.qweight, proj_or_weight.scales, proj_or_weight.group_size, proj_bias)
     if isinstance(proj_or_weight, MarlinInt8Linear):
         if bias is not None:
             raise RuntimeError("MarlinInt8Linear does not support runtime bias override.")
@@ -232,11 +229,12 @@ _rwkv7_tmix_seq_batch = _rwkv7_tmix_seq_batch_impl
 
 def _rwkv7_decode_block_batch_contiguous(
     x: torch.Tensor,
-    att_tokenshift_cache: torch.Tensor,
-    state_cache: torch.Tensor,
-    ffn_tokenshift_cache: torch.Tensor,
-    slot_mapping_in: torch.Tensor,
-    slot_mapping_out: torch.Tensor,
+    att_tokenshift_cache_in: torch.Tensor,
+    att_tokenshift_cache_out: torch.Tensor,
+    state_cache_in: torch.Tensor,
+    state_cache_out: torch.Tensor,
+    ffn_tokenshift_cache_in: torch.Tensor,
+    ffn_tokenshift_cache_out: torch.Tensor,
     positions: torch.Tensor,
     v_first: torch.Tensor | None,
     layer_idx: int,
@@ -277,20 +275,14 @@ def _rwkv7_decode_block_batch_contiguous(
     ffn_x_k: torch.Tensor,
     ffn_key_proj,
     ffn_value_proj,
-    decode_tokenshift_scratch: torch.Tensor | None = None,
-    assume_local_contiguous: bool = False,
+    decode_tokenshift_scratch: torch.Tensor,
 ):
     bsz, c = x.shape
     h = F.layer_norm(x, (c,), ln1_gamma, ln1_beta, ln1_eps)
-    h_cache = h.to(att_tokenshift_cache.dtype)
-    if assume_local_contiguous:
-        assert decode_tokenshift_scratch is not None
-        x_prev = decode_tokenshift_scratch[:bsz]
-        x_prev.copy_(att_tokenshift_cache)
-        att_tokenshift_cache.copy_(h_cache)
-    else:
-        x_prev = att_tokenshift_cache[slot_mapping_in].to(h.dtype)
-        att_tokenshift_cache[slot_mapping_out] = h_cache
+    h_cache = h.to(att_tokenshift_cache_out.dtype)
+    x_prev = decode_tokenshift_scratch[:bsz]
+    x_prev.copy_(att_tokenshift_cache_in)
+    att_tokenshift_cache_out.copy_(h_cache)
     xx = x_prev - h
     xr = torch.addcmul(h, xx, x_r)
     xw = torch.addcmul(h, xx, x_w)
@@ -316,30 +308,17 @@ def _rwkv7_decode_block_batch_contiguous(
         assert v_first is not None
         v = v + (v_first - v) * torch.sigmoid(_linear_dispatch(_linear_dispatch(xv, v1_proj), v2_proj, bias=v0))
 
-    if assume_local_contiguous:
-        y = wkv7_one_batch_cuda(
-            state_cache,
-            state_cache,
-            r,
-            w,
-            k,
-            v,
-            -kk,
-            kka,
-            positions,
-        )
-    else:
-        y = _wkv7_one_batch_inplace_by_slot_runs(
-            state_cache,
-            slot_mapping_in,
-            r,
-            w,
-            k,
-            v,
-            -kk,
-            kka,
-            positions,
-        )
+    y = wkv7_one_batch_cuda(
+        state_cache_in,
+        state_cache_out,
+        r,
+        w,
+        k,
+        v,
+        -kk,
+        kka,
+        positions,
+    )
     y = F.group_norm(y.view_as(r), num_groups=num_heads, weight=ln_x_weight, bias=ln_x_bias, eps=64e-5)
     y = y + (
         ((r * k * r_k).view(-1, num_heads, head_dim).sum(dim=-1, keepdim=True) * v.view(-1, num_heads, head_dim)).view_as(r)
@@ -348,15 +327,10 @@ def _rwkv7_decode_block_batch_contiguous(
     x.add_(y)
 
     h2 = F.layer_norm(x, (c,), ln2_gamma, ln2_beta, ln2_eps)
-    h2_cache = h2.to(ffn_tokenshift_cache.dtype)
-    if assume_local_contiguous:
-        assert decode_tokenshift_scratch is not None
-        x_prev_ffn = decode_tokenshift_scratch[:bsz]
-        x_prev_ffn.copy_(ffn_tokenshift_cache)
-        ffn_tokenshift_cache.copy_(h2_cache)
-    else:
-        x_prev_ffn = ffn_tokenshift_cache[slot_mapping_in].to(h2.dtype)
-        ffn_tokenshift_cache[slot_mapping_out] = h2_cache
+    h2_cache = h2.to(ffn_tokenshift_cache_out.dtype)
+    x_prev_ffn = decode_tokenshift_scratch[:bsz]
+    x_prev_ffn.copy_(ffn_tokenshift_cache_in)
+    ffn_tokenshift_cache_out.copy_(h2_cache)
     xx = x_prev_ffn - h2
     k_ffn = torch.addcmul(h2, xx, ffn_x_k)
     k_ffn = torch.relu(_linear_dispatch(k_ffn, ffn_key_proj)) ** 2
@@ -1285,22 +1259,25 @@ class RWKV7Model(nn.Module):
             use_scripted_contiguous_decode = (
                 x.dim() == 2
                 and x.size(0) > 1
-                and torch.equal(slot_mapping_in, slot_mapping_out)
                 and _is_contiguous_in_order(slot_mapping_in)
+                and _is_contiguous_in_order(slot_mapping_out)
+                and slot_mapping_in.numel() == slot_mapping_out.numel()
             )
             if use_scripted_contiguous_decode:
-                slot_start = int(slot_mapping_in[0].item())
-                slot_end = slot_start + slot_mapping_in.numel()
-                local_slots = torch.arange(slot_mapping_in.numel(), device=slot_mapping_in.device, dtype=slot_mapping_in.dtype)
+                slot_in_start = int(slot_mapping_in[0].item())
+                slot_in_end = slot_in_start + slot_mapping_in.numel()
+                slot_out_start = int(slot_mapping_out[0].item())
+                slot_out_end = slot_out_start + slot_mapping_out.numel()
                 v_first_seq = None
                 for block in self.blocks:
                     x, v_first_seq = _rwkv7_decode_block_batch_contiguous(
                         x,
-                        block.att.att_tokenshift_cache[slot_start:slot_end],
-                        block.att.state_cache[slot_start:slot_end],
-                        block.ffn.ffn_tokenshift_cache[slot_start:slot_end],
-                        local_slots,
-                        local_slots,
+                        block.att.att_tokenshift_cache[slot_in_start:slot_in_end],
+                        block.att.att_tokenshift_cache[slot_out_start:slot_out_end],
+                        block.att.state_cache[slot_in_start:slot_in_end],
+                        block.att.state_cache[slot_out_start:slot_out_end],
+                        block.ffn.ffn_tokenshift_cache[slot_in_start:slot_in_end],
+                        block.ffn.ffn_tokenshift_cache[slot_out_start:slot_out_end],
                         positions,
                         v_first_seq,
                         block.layer_idx,
@@ -1342,7 +1319,6 @@ class RWKV7Model(nn.Module):
                         block.ffn.key_proj,
                         block.ffn.value_proj,
                         self.decode_tokenshift_scratch,
-                        True,
                     )
                 v_first = v_first_seq
             else:
