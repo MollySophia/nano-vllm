@@ -291,3 +291,19 @@ def wkv7_seq_batch(
     elapsed_t: torch.Tensor,
 ) -> torch.Tensor:
     return rwkv7_seq_batch_op(state_in, state_out, r, w, k, v, a, b, elapsed_t)
+
+
+def cmix_one(
+    x_0: torch.Tensor,
+    x_1: torch.Tensor,
+    x_k: torch.Tensor,
+    key: torch.Tensor,
+    val: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops.nanovllm_rwkv7_state_fwd_fp16.cmix_one(
+        x_0.contiguous(),
+        x_1,
+        x_k.contiguous(),
+        key.contiguous(),
+        val.contiguous(),
+    )

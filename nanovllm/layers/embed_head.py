@@ -84,7 +84,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         if self.tp_size == 1 and x.dim() == 2:
             if self.use_int8:
                 return _int8_per_channel_cublas(x, self.qweight, self.scales, self.scales_fp16, None)
-            return torch.matmul(x, self.weight)
+            return F.linear(x, self.weight.t())
         context = get_context()
         if context.is_prefill:
             if x.dim() == 3:
@@ -95,7 +95,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         if self.use_int8:
             logits = _int8_per_channel_cublas(x, self.qweight, self.scales, self.scales_fp16, None)
         else:
-            logits = torch.matmul(x, self.weight)
+            logits = F.linear(x, self.weight.t())
         if self.tp_size > 1:
             logits = _gather_logits(logits, self.tp_size, self.tp_rank)
         return logits

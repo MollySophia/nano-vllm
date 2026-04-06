@@ -6,6 +6,7 @@ import time
 import torch
 
 from nanovllm import LLM, SamplingParams
+from nanovllm.utils.context import reset_context
 
 
 def ensure_model_dir(model_pth: str) -> str:
@@ -29,15 +30,16 @@ def run_decode_only(
     rwkv_prefill_token_budget: int,
     rwkv_prefill_max_batch_size: int,
     rwkv_quant_int8: bool,
-):
+    enforce_eager: bool,
+) -> tuple[int, int, int, float, float, float | None]:
     model_dir = ensure_model_dir(model_pth)
     # Prefill consumes the first sampled token, so request one extra token to leave
     # exactly `decode_steps` decode iterations after prefill.
-    sampling_params = SamplingParams(temperature=1e-4, ignore_eos=True, max_tokens=decode_steps + 1)
+    sampling_params = SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=decode_steps + 1)
     requested_max_num_seqs = concurrency if concurrency != -1 else 4096
     llm = LLM(
         model_dir,
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         tensor_parallel_size=1,
         max_num_seqs=requested_max_num_seqs,
         max_num_batched_tokens=max(16384, requested_max_num_seqs * len(prompt_tokens)),
@@ -59,6 +61,32 @@ def run_decode_only(
     seqs = list(llm.scheduler.running)
     assert len(seqs) == concurrency, f"len(seqs) = {len(seqs)}, concurrency = {concurrency}, specified concurrency exceeded calculated memory limit"
 
+    if concurrency == 1:
+        seq = seqs[0]
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        input_ids, positions, temperatures = llm.model_runner.prepare_decode_single(seq)
+        next_token = torch.tensor([seq.last_token], device=input_ids.device, dtype=input_ids.dtype)
+        context_lens = llm.model_runner._bs1_decode_tensors["context_lens"]
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        steps = 0
+        while steps < decode_steps:
+            input_ids[0] = next_token[0]
+            next_token = llm.model_runner.decode_single_step(seq, input_ids, positions, temperatures, record_sequence=False)
+            positions.add_(1)
+            context_lens.add_(1)
+            steps += 1
+        torch.cuda.synchronize()
+        loop_dt = time.perf_counter() - t1
+        reset_context()
+        dt = time.perf_counter() - t0
+        resident_blocks = llm.model_runner.config.num_state_blocks
+        llm.model_runner.call("exit")
+        decode_tps = concurrency * steps / dt
+        steady_decode_tps = concurrency * steps / loop_dt
+        return concurrency, resident_blocks, steps, dt, decode_tps, steady_decode_tps
+
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     steps = 0
@@ -72,7 +100,7 @@ def run_decode_only(
     resident_blocks = llm.model_runner.config.num_state_blocks
     llm.exit()
     decode_tps = concurrency * steps / dt
-    return concurrency, resident_blocks, steps, dt, decode_tps
+    return concurrency, resident_blocks, steps, dt, decode_tps, None
 
 
 def main():
@@ -85,11 +113,12 @@ def main():
     parser.add_argument("--rwkv-prefill-token-budget", type=int, default=2048)
     parser.add_argument("--rwkv-prefill-max-batch-size", type=int, default=128)
     parser.add_argument("--rwkv-quant-int8", action="store_true")
+    parser.add_argument("--enforce-eager", action="store_true")
     args = parser.parse_args()
 
     for n in args.concurrency:
         torch.cuda.empty_cache()
-        actual_n, resident_blocks, steps, dt, decode_tps = run_decode_only(
+        actual_n, resident_blocks, steps, dt, decode_tps, steady_decode_tps = run_decode_only(
             args.model_pth,
             n,
             args.prompt_tokens,
@@ -98,8 +127,9 @@ def main():
             args.rwkv_prefill_token_budget,
             args.rwkv_prefill_max_batch_size,
             args.rwkv_quant_int8,
+            args.enforce_eager,
         )
-        print(
+        summary = (
             f"gpu_memory_utilization={args.gpu_memory_utilization:.2f},"
             f"rwkv_prefill_token_budget={args.rwkv_prefill_token_budget},"
             f"rwkv_prefill_max_batch_size={args.rwkv_prefill_max_batch_size},"
@@ -107,6 +137,9 @@ def main():
             f"n={actual_n},resident_blocks={resident_blocks},decode_steps={steps},"
             f"time_s={dt:.4f},decode_tps={decode_tps:.2f}"
         )
+        if steady_decode_tps is not None:
+            summary += f",steady_decode_tps={steady_decode_tps:.2f}"
+        print(summary)
         torch.cuda.empty_cache()
 
 

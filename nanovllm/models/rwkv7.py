@@ -2,21 +2,32 @@ import os
 import sys
 import math
 import gc
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from nanovllm.layers.layernorm import LayerNorm
-from nanovllm.layers.linear import RowParallelLinear, ColumnParallelLinear, MatmulLinear, MarlinInt8Linear, get_marlin_impl_or_raise
+from nanovllm.layers.linear import (
+    RowParallelLinear,
+    ColumnParallelLinear,
+    MatmulLinear,
+    MarlinInt8Linear,
+    get_marlin_impl_or_raise,
+    _preload_env_cuda_libs,
+)
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.utils.context import get_context
 from nanovllm.ops.rwkv7_cuda import (
     ensure_loaded as ensure_rwkv7_cuda_loaded,
-    wkv7_one as wkv7_one_cuda,
+    cmix_one as rwkv7_cmix_one_cuda,
+    rwkv7_one_op as rwkv7_one_cuda,
     wkv7_one_batch as wkv7_one_batch_cuda,
     wkv7_seq as wkv7_seq_cuda,
     wkv7_seq_batch as wkv7_seq_batch_cuda,
 )
+
+_preload_env_cuda_libs()
 
 
 # Constants for w transformation (from Albatross CUDA kernel)
@@ -41,8 +52,10 @@ def _maybe_compile_rwkv_helper(fn):
 def _matmul_linear_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
+    bias: Optional[torch.Tensor] = None,
 ):
+    if x.dim() == 1 and weight.dim() == 2:
+        return F.linear(x, weight.t(), bias)
     y = torch.matmul(x, weight)
     if bias is not None:
         y = y + bias
@@ -63,6 +76,11 @@ def _linear_dispatch(
         if bias is not None:
             raise RuntimeError("MarlinInt8Linear does not support runtime bias override.")
         return proj_or_weight(x)
+    if isinstance(proj_or_weight, MatmulLinear):
+        proj_bias = bias if bias is not None else proj_or_weight.bias
+        if proj_or_weight.weight_layout == "out_in":
+            return F.linear(x, proj_or_weight.weight, proj_bias)
+        return _matmul_linear(x, proj_or_weight.weight, bias=proj_bias)
     proj_bias = bias if bias is not None else proj_or_weight.bias
     return _matmul_linear(x, proj_or_weight.weight, bias=proj_bias)
 
@@ -102,6 +120,7 @@ def _rwkv7_tmix_one_impl(
     ln_x_bias: torch.Tensor,
 ):
     xx = x_prev - x
+    x_prev.copy_(x)
     xr = torch.addcmul(x, xx, x_r)
     xw = torch.addcmul(x, xx, x_w)
     xk = torch.addcmul(x, xx, x_k)
@@ -110,11 +129,11 @@ def _rwkv7_tmix_one_impl(
     xg = torch.addcmul(x, xx, x_g)
 
     r = _matmul_linear(xr, receptance_weight)
-    w = _matmul_linear(torch.tanh(_matmul_linear(xw, w1)), w2, bias=w0)
+    w = F.linear(torch.tanh(F.linear(xw, w1)), w2, bias=w0)
     k = _matmul_linear(xk, key_weight)
     v = _matmul_linear(xv, value_weight)
-    a = torch.sigmoid(_matmul_linear(_matmul_linear(xa, a1), a2, bias=a0))
-    g = _matmul_linear(torch.sigmoid(_matmul_linear(xg, g1)), g2)
+    a = torch.sigmoid(F.linear(F.linear(xa, a1), a2, bias=a0))
+    g = F.linear(torch.sigmoid(F.linear(xg, g1)), g2)
     kk = F.normalize((k * k_k).view(-1, num_heads, head_dim), dim=-1, p=2.0).view_as(k)
     k = k * (1 + (a - 1) * k_a)
     kka = kk * a
@@ -123,7 +142,7 @@ def _rwkv7_tmix_one_impl(
         v_first_out = v
     else:
         assert v_first is not None
-        v = v + (v_first - v) * torch.sigmoid(_matmul_linear(_matmul_linear(xv, v1), v2, bias=v0))
+        v = v + (v_first - v) * torch.sigmoid(F.linear(F.linear(xv, v1), v2, bias=v0))
         v_first_out = v_first
 
     return r, w, k, v, a, kk, kka, g, v_first_out, xx
@@ -298,8 +317,8 @@ def _rwkv7_decode_block_batch_contiguous(
     a = torch.sigmoid(_linear_dispatch(_linear_dispatch(xa, a1_proj), a2_proj, bias=a0))
     g = _linear_dispatch(torch.sigmoid(_linear_dispatch(xg, g1_proj)), g2_proj)
 
-    kk = F.normalize((k * k_k).view(bsz, num_heads, head_dim), dim=-1, p=2.0).view_as(k)
-    k = k * (1 + (a - 1) * k_a)
+    kk = F.normalize((k * k_k.view(1, 1, c)).view(bsz, num_heads, head_dim), dim=-1, p=2.0).view(bsz, c)
+    k = k * (1 + (a - 1) * k_a.view(1, c))
     kka = kk * a
 
     if layer_idx == 0:
@@ -319,9 +338,9 @@ def _rwkv7_decode_block_batch_contiguous(
         kka,
         positions,
     )
-    y = F.group_norm(y.view_as(r), num_groups=num_heads, weight=ln_x_weight, bias=ln_x_bias, eps=64e-5)
+    y = F.group_norm(y.view(bsz, c), num_groups=num_heads, weight=ln_x_weight, bias=ln_x_bias, eps=64e-5)
     y = y + (
-        ((r * k * r_k).view(-1, num_heads, head_dim).sum(dim=-1, keepdim=True) * v.view(-1, num_heads, head_dim)).view_as(r)
+        ((r * k * r_k.view(1, c)).view(bsz, num_heads, head_dim).sum(dim=-1, keepdim=True) * v.view(bsz, num_heads, head_dim)).view(bsz, c)
     )
     y = _linear_dispatch(y * g, output_proj)
     x.add_(y)
@@ -336,6 +355,196 @@ def _rwkv7_decode_block_batch_contiguous(
     k_ffn = torch.relu(_linear_dispatch(k_ffn, ffn_key_proj)) ** 2
     x.add_(_linear_dispatch(k_ffn, ffn_value_proj))
     return x, v_first
+
+
+def _rwkv7_decode_block_one_contiguous(
+    x: torch.Tensor,
+    att_tokenshift_cache_in: torch.Tensor,
+    att_tokenshift_cache_out: torch.Tensor,
+    state_cache_in: torch.Tensor,
+    state_cache_out: torch.Tensor,
+    ffn_tokenshift_cache_in: torch.Tensor,
+    ffn_tokenshift_cache_out: torch.Tensor,
+    positions: torch.Tensor,
+    v_first: torch.Tensor | None,
+    layer_idx: int,
+    num_heads: int,
+    head_dim: int,
+    x_r: torch.Tensor,
+    x_w: torch.Tensor,
+    x_k: torch.Tensor,
+    x_v: torch.Tensor,
+    x_a: torch.Tensor,
+    x_g: torch.Tensor,
+    w0: torch.Tensor,
+    w1_proj,
+    w2_proj,
+    a0: torch.Tensor,
+    a1_proj,
+    a2_proj,
+    v0: torch.Tensor,
+    v1_proj,
+    v2_proj,
+    g1_proj,
+    g2_proj,
+    k_k: torch.Tensor,
+    k_a: torch.Tensor,
+    r_k: torch.Tensor,
+    receptance_proj,
+    key_proj,
+    value_proj,
+    output_proj,
+    ln_x_weight: torch.Tensor,
+    ln_x_bias: torch.Tensor,
+    ln1_gamma: torch.Tensor,
+    ln1_beta: torch.Tensor,
+    ln1_eps: float,
+    ln2_gamma: torch.Tensor,
+    ln2_beta: torch.Tensor,
+    ln2_eps: float,
+    ffn_x_k: torch.Tensor,
+    ffn_key_proj,
+    ffn_value_proj,
+    decode_tokenshift_scratch: torch.Tensor,
+):
+    use_fp16_tmix_helper = (
+        isinstance(receptance_proj, MatmulLinear)
+        and isinstance(w1_proj, MatmulLinear)
+        and isinstance(w2_proj, MatmulLinear)
+        and isinstance(key_proj, MatmulLinear)
+        and isinstance(value_proj, MatmulLinear)
+        and isinstance(a1_proj, MatmulLinear)
+        and isinstance(a2_proj, MatmulLinear)
+        and isinstance(v1_proj, MatmulLinear)
+        and isinstance(v2_proj, MatmulLinear)
+        and isinstance(g1_proj, MatmulLinear)
+        and isinstance(g2_proj, MatmulLinear)
+    )
+    if use_fp16_tmix_helper:
+        x0 = x[0]
+        h = F.layer_norm(x0, (x0.shape[-1],), ln1_gamma, ln1_beta, ln1_eps)
+        if att_tokenshift_cache_out.data_ptr() != att_tokenshift_cache_in.data_ptr():
+            att_tokenshift_cache_out[0].copy_(att_tokenshift_cache_in[0])
+        x_prev = att_tokenshift_cache_out[0]
+        r, w, k, v, a, kk, kka, g, v_first, xx = _rwkv7_tmix_one(
+            layer_idx,
+            num_heads,
+            head_dim,
+            h,
+            x_prev,
+            v_first,
+            x_r,
+            x_w,
+            x_k,
+            x_v,
+            x_a,
+            x_g,
+            w0,
+            w1_proj.weight,
+            w2_proj.weight,
+            a0,
+            a1_proj.weight,
+            a2_proj.weight,
+            v0,
+            v1_proj.weight,
+            v2_proj.weight,
+            g1_proj.weight,
+            g2_proj.weight,
+            k_k,
+            k_a,
+            r_k,
+            receptance_proj.weight,
+            key_proj.weight,
+            value_proj.weight,
+            output_proj.weight,
+            ln_x_weight,
+            ln_x_bias,
+        )
+    else:
+        x0 = x[0]
+        h = F.layer_norm(x0, (x0.shape[-1],), ln1_gamma, ln1_beta, ln1_eps)
+        h_cache = h.to(att_tokenshift_cache_out.dtype)
+        x_prev = decode_tokenshift_scratch[0]
+        x_prev.copy_(att_tokenshift_cache_in[0])
+        xx = x_prev - h
+        att_tokenshift_cache_out[0].copy_(h_cache)
+        xr = torch.addcmul(h, xx, x_r)
+        xw = torch.addcmul(h, xx, x_w)
+        xk = torch.addcmul(h, xx, x_k)
+        xv = torch.addcmul(h, xx, x_v)
+        xa = torch.addcmul(h, xx, x_a)
+        xg = torch.addcmul(h, xx, x_g)
+        r = _linear_dispatch(xr, receptance_proj)
+        w = _linear_dispatch(torch.tanh(_linear_dispatch(xw, w1_proj)), w2_proj, bias=w0)
+        k = _linear_dispatch(xk, key_proj)
+        v = _linear_dispatch(xv, value_proj)
+        a = torch.sigmoid(_linear_dispatch(_linear_dispatch(xa, a1_proj), a2_proj, bias=a0))
+        g = _linear_dispatch(torch.sigmoid(_linear_dispatch(xg, g1_proj)), g2_proj)
+        kk = F.normalize((k * k_k).view(1, num_heads, head_dim), dim=-1, p=2.0).view_as(k)
+        k = k * (1 + (a - 1) * k_a)
+        kka = kk * a
+        if layer_idx == 0:
+            v_first = v
+        else:
+            assert v_first is not None
+            v = v + (v_first - v) * torch.sigmoid(_linear_dispatch(_linear_dispatch(xv, v1_proj), v2_proj, bias=v0))
+    y = rwkv7_one_cuda(
+        state_cache_in[0],
+        state_cache_out[0],
+        r,
+        w,
+        k,
+        v,
+        -kk,
+        kka,
+        positions[0:1],
+    )
+    if use_fp16_tmix_helper and isinstance(output_proj, MatmulLinear):
+        y = _rwkv7_tmix_one_post(
+            num_heads,
+            head_dim,
+            y.view(1, -1),
+            r.view(1, -1),
+            k.view(1, -1),
+            v.view(1, -1),
+            g.view(1, -1),
+            r_k,
+            output_proj.weight,
+            ln_x_weight,
+            ln_x_bias,
+        ).view(-1)
+    else:
+        y = F.group_norm(y.view(1, -1), num_groups=num_heads, weight=ln_x_weight, bias=ln_x_bias, eps=64e-5).view(-1)
+        y = y + ((r * k * r_k).view(1, num_heads, head_dim).sum(dim=-1, keepdim=True) * v.view(1, num_heads, head_dim)).view_as(r)
+        y = _linear_dispatch(y * g, output_proj)
+    x0.add_(y)
+
+    h2 = F.layer_norm(x0, (x0.shape[-1],), ln2_gamma, ln2_beta, ln2_eps)
+    if (
+        isinstance(ffn_key_proj, MatmulLinear)
+        and isinstance(ffn_value_proj, MatmulLinear)
+        and ffn_key_proj.weight_layout == "out_in"
+        and ffn_value_proj.weight_layout == "in_out"
+    ):
+        if ffn_tokenshift_cache_out.data_ptr() != ffn_tokenshift_cache_in.data_ptr():
+            ffn_tokenshift_cache_out[0].copy_(ffn_tokenshift_cache_in[0])
+        x_prev_ffn = ffn_tokenshift_cache_out[0]
+        x0.add_(rwkv7_cmix_one_cuda(h2, x_prev_ffn, ffn_x_k, ffn_key_proj.weight, ffn_value_proj.weight))
+    else:
+        h2_cache = h2.to(ffn_tokenshift_cache_out.dtype)
+        x_prev_ffn = decode_tokenshift_scratch[0]
+        x_prev_ffn.copy_(ffn_tokenshift_cache_in[0])
+        ffn_tokenshift_cache_out[0].copy_(h2_cache)
+        xx = x_prev_ffn - h2
+        if isinstance(ffn_key_proj, MatmulLinear) and isinstance(ffn_value_proj, MatmulLinear):
+            x0.add_(_rwkv7_ffn_decode(h2, xx, ffn_x_k, ffn_key_proj.weight, ffn_value_proj.weight))
+        else:
+            k_ffn = torch.addcmul(h2, xx, ffn_x_k)
+            k_ffn = torch.relu(_linear_dispatch(k_ffn, ffn_key_proj)) ** 2
+            x0.add_(_linear_dispatch(k_ffn, ffn_value_proj))
+    return x, v_first
+
+
 
 
 def wkv7_one_step(state: torch.Tensor, r: torch.Tensor, w: torch.Tensor, k: torch.Tensor,
@@ -451,6 +660,19 @@ def _wkv7_one_batch_inplace_by_slot_runs(
     kka: torch.Tensor,
     positions: torch.Tensor,
 ):
+    context = get_context()
+    if getattr(context, "force_regular_decode", False):
+        return wkv7_one_batch_cuda(
+            state_cache[slot_mapping],
+            state_cache[slot_mapping],
+            r,
+            w,
+            k,
+            v,
+            kk,
+            kka,
+            positions,
+        )
     if _is_contiguous_in_order(slot_mapping):
         slot_start = int(slot_mapping[0].item())
         slot_end = slot_start + slot_mapping.numel()
@@ -510,6 +732,19 @@ def _wkv7_one_batch_out_by_slot_runs(
     kka: torch.Tensor,
     positions: torch.Tensor,
 ):
+    context = get_context()
+    if getattr(context, "force_regular_decode", False):
+        return wkv7_one_batch_cuda(
+            state_cache[slot_mapping_in],
+            state_cache[slot_mapping_out],
+            r,
+            w,
+            k,
+            v,
+            kk,
+            kka,
+            positions,
+        )
     if _is_contiguous_in_order(slot_mapping_in) and _is_contiguous_in_order(slot_mapping_out):
         slot_in_start = int(slot_mapping_in[0].item())
         slot_out_start = int(slot_mapping_out[0].item())
@@ -704,14 +939,14 @@ class RWKV7Attention(nn.Module):
         self.key_proj = MatmulLinear(hidden_size, hidden_size)
         self.value_proj = MatmulLinear(hidden_size, hidden_size)
         self.output_proj = MatmulLinear(hidden_size, hidden_size)
-        self.w1_proj = MatmulLinear(hidden_size, 128)
-        self.w2_proj = MatmulLinear(128, hidden_size)
-        self.a1_proj = MatmulLinear(hidden_size, 128)
-        self.a2_proj = MatmulLinear(128, hidden_size)
-        self.v1_proj = MatmulLinear(hidden_size, 96)
-        self.v2_proj = MatmulLinear(96, hidden_size)
-        self.g1_proj = MatmulLinear(hidden_size, 480)
-        self.g2_proj = MatmulLinear(480, hidden_size)
+        self.w1_proj = MatmulLinear(hidden_size, 128, weight_layout="out_in")
+        self.w2_proj = MatmulLinear(128, hidden_size, weight_layout="out_in")
+        self.a1_proj = MatmulLinear(hidden_size, 128, weight_layout="out_in")
+        self.a2_proj = MatmulLinear(128, hidden_size, weight_layout="out_in")
+        self.v1_proj = MatmulLinear(hidden_size, 96, weight_layout="out_in")
+        self.v2_proj = MatmulLinear(96, hidden_size, weight_layout="out_in")
+        self.g1_proj = MatmulLinear(hidden_size, 480, weight_layout="out_in")
+        self.g2_proj = MatmulLinear(480, hidden_size, weight_layout="out_in")
 
     @property
     def receptance_weight(self):
@@ -1027,6 +1262,8 @@ class RWKV7Attention(nn.Module):
         """Decode: x is [batch, hidden_size]"""
         B, C = x.shape
         H, N = self.num_heads, self.head_dim
+        context = get_context()
+        assume_equal_slots = getattr(context, "force_regular_decode", False)
 
         x_prev = self.att_tokenshift_cache[slot_mapping_in].to(x.dtype)
         self.att_tokenshift_cache[slot_mapping_out] = x.to(self.att_tokenshift_cache.dtype)
@@ -1056,7 +1293,7 @@ class RWKV7Attention(nn.Module):
 
         self._maybe_init_cuda_kernel()
         if self._cuda_kernel_ready and x.is_cuda and x.dtype == torch.float16:
-            if torch.equal(slot_mapping_in, slot_mapping_out):
+            if assume_equal_slots or torch.equal(slot_mapping_in, slot_mapping_out):
                 y = _wkv7_one_batch_inplace_by_slot_runs(
                     self.state_cache,
                     slot_mapping_in,
@@ -1115,7 +1352,7 @@ class RWKV7FeedForward(nn.Module):
         self.ffn_tokenshift_cache = None  # [num_blocks, hidden_size]
 
         # Parameters will be registered as buffers in _load_weights
-        self.key_proj = MatmulLinear(hidden_size, intermediate_size)
+        self.key_proj = MatmulLinear(hidden_size, intermediate_size, weight_layout="out_in")
         self.value_proj = MatmulLinear(intermediate_size, hidden_size)
 
     @property
@@ -1163,8 +1400,8 @@ class RWKV7FeedForward(nn.Module):
 
         xx = x_prev - x
         k = x + xx * self.x_k
-        k = torch.relu(_linear_dispatch(k, self.key_proj)) ** 2
-        return _linear_dispatch(k, self.value_proj)
+        k = torch.relu(self.key_proj(k)) ** 2
+        return self.value_proj(k)
 
     def _forward_decode(self, x: torch.Tensor, slot_mapping_in: torch.Tensor, slot_mapping_out: torch.Tensor):
         """Decode"""
@@ -1172,8 +1409,8 @@ class RWKV7FeedForward(nn.Module):
         xx = x_prev - x
         self.ffn_tokenshift_cache[slot_mapping_out] = x.to(self.ffn_tokenshift_cache.dtype)
         k = torch.addcmul(x, xx, self.x_k)
-        k = torch.relu(self.key_proj(k)) ** 2
-        return self.value_proj(k)
+        k = torch.relu(_linear_dispatch(k, self.key_proj)) ** 2
+        return _linear_dispatch(k, self.value_proj)
 
 
 class RWKV7Block(nn.Module):
@@ -1256,70 +1493,135 @@ class RWKV7Model(nn.Module):
             slot_mapping_in = context.slot_mapping_in
             slot_mapping_out = context.slot_mapping_out
             v_first = None
+            force_contiguous_decode = getattr(context, "force_contiguous_decode", False)
             use_scripted_contiguous_decode = (
                 x.dim() == 2
-                and x.size(0) > 1
-                and _is_contiguous_in_order(slot_mapping_in)
-                and _is_contiguous_in_order(slot_mapping_out)
-                and slot_mapping_in.numel() == slot_mapping_out.numel()
+                and (
+                    force_contiguous_decode
+                    or (
+                        x.size(0) > 1
+                        and not context.force_regular_decode
+                        and _is_contiguous_in_order(slot_mapping_in)
+                        and _is_contiguous_in_order(slot_mapping_out)
+                        and slot_mapping_in.numel() == slot_mapping_out.numel()
+                    )
+                )
             )
             if use_scripted_contiguous_decode:
-                slot_in_start = int(slot_mapping_in[0].item())
-                slot_in_end = slot_in_start + slot_mapping_in.numel()
-                slot_out_start = int(slot_mapping_out[0].item())
-                slot_out_end = slot_out_start + slot_mapping_out.numel()
+                if force_contiguous_decode:
+                    slot_in_start = int(getattr(context, "contiguous_decode_slot_in_start"))
+                    slot_out_start = int(getattr(context, "contiguous_decode_slot_out_start"))
+                    slot_count = int(getattr(context, "contiguous_decode_slot_count"))
+                else:
+                    slot_in_start = int(slot_mapping_in[0].item())
+                    slot_out_start = int(slot_mapping_out[0].item())
+                    slot_count = slot_mapping_in.numel()
+                slot_in_end = slot_in_start + slot_count
+                slot_out_end = slot_out_start + slot_count
                 v_first_seq = None
                 for block in self.blocks:
-                    x, v_first_seq = _rwkv7_decode_block_batch_contiguous(
-                        x,
-                        block.att.att_tokenshift_cache[slot_in_start:slot_in_end],
-                        block.att.att_tokenshift_cache[slot_out_start:slot_out_end],
-                        block.att.state_cache[slot_in_start:slot_in_end],
-                        block.att.state_cache[slot_out_start:slot_out_end],
-                        block.ffn.ffn_tokenshift_cache[slot_in_start:slot_in_end],
-                        block.ffn.ffn_tokenshift_cache[slot_out_start:slot_out_end],
-                        positions,
-                        v_first_seq,
-                        block.layer_idx,
-                        block.att.num_heads,
-                        block.att.head_dim,
-                        block.att.x_r,
-                        block.att.x_w,
-                        block.att.x_k,
-                        block.att.x_v,
-                        block.att.x_a,
-                        block.att.x_g,
-                        block.att.w0,
-                        block.att.w1_proj,
-                        block.att.w2_proj,
-                        block.att.a0,
-                        block.att.a1_proj,
-                        block.att.a2_proj,
-                        block.att.v0,
-                        block.att.v1_proj,
-                        block.att.v2_proj,
-                        block.att.g1_proj,
-                        block.att.g2_proj,
-                        block.att.k_k,
-                        block.att.k_a,
-                        block.att.r_k,
-                        block.att.receptance_proj,
-                        block.att.key_proj,
-                        block.att.value_proj,
-                        block.att.output_proj,
-                        block.att.ln_x_weight,
-                        block.att.ln_x_bias,
-                        block.ln1.gamma,
-                        block.ln1.beta,
-                        block.ln1.eps,
-                        block.ln2.gamma,
-                        block.ln2.beta,
-                        block.ln2.eps,
-                        block.ffn.x_k,
-                        block.ffn.key_proj,
-                        block.ffn.value_proj,
-                        self.decode_tokenshift_scratch,
-                    )
+                    if slot_count == 1:
+                        x, v_first_seq = _rwkv7_decode_block_one_contiguous(
+                            x,
+                            block.att.att_tokenshift_cache[slot_in_start:slot_in_end],
+                            block.att.att_tokenshift_cache[slot_out_start:slot_out_end],
+                            block.att.state_cache[slot_in_start:slot_in_end],
+                            block.att.state_cache[slot_out_start:slot_out_end],
+                            block.ffn.ffn_tokenshift_cache[slot_in_start:slot_in_end],
+                            block.ffn.ffn_tokenshift_cache[slot_out_start:slot_out_end],
+                            positions,
+                            v_first_seq,
+                            block.layer_idx,
+                            block.att.num_heads,
+                            block.att.head_dim,
+                            block.att.x_r,
+                            block.att.x_w,
+                            block.att.x_k,
+                            block.att.x_v,
+                            block.att.x_a,
+                            block.att.x_g,
+                            block.att.w0,
+                            block.att.w1_proj,
+                            block.att.w2_proj,
+                            block.att.a0,
+                            block.att.a1_proj,
+                            block.att.a2_proj,
+                            block.att.v0,
+                            block.att.v1_proj,
+                            block.att.v2_proj,
+                            block.att.g1_proj,
+                            block.att.g2_proj,
+                            block.att.k_k,
+                            block.att.k_a,
+                            block.att.r_k,
+                            block.att.receptance_proj,
+                            block.att.key_proj,
+                            block.att.value_proj,
+                            block.att.output_proj,
+                            block.att.ln_x_weight,
+                            block.att.ln_x_bias,
+                            block.ln1.gamma,
+                            block.ln1.beta,
+                            block.ln1.eps,
+                            block.ln2.gamma,
+                            block.ln2.beta,
+                            block.ln2.eps,
+                            block.ffn.x_k,
+                            block.ffn.key_proj,
+                            block.ffn.value_proj,
+                            self.decode_tokenshift_scratch,
+                        )
+                    else:
+                        x, v_first_seq = _rwkv7_decode_block_batch_contiguous(
+                            x,
+                            block.att.att_tokenshift_cache[slot_in_start:slot_in_end],
+                            block.att.att_tokenshift_cache[slot_out_start:slot_out_end],
+                            block.att.state_cache[slot_in_start:slot_in_end],
+                            block.att.state_cache[slot_out_start:slot_out_end],
+                            block.ffn.ffn_tokenshift_cache[slot_in_start:slot_in_end],
+                            block.ffn.ffn_tokenshift_cache[slot_out_start:slot_out_end],
+                            positions,
+                            v_first_seq,
+                            block.layer_idx,
+                            block.att.num_heads,
+                            block.att.head_dim,
+                            block.att.x_r,
+                            block.att.x_w,
+                            block.att.x_k,
+                            block.att.x_v,
+                            block.att.x_a,
+                            block.att.x_g,
+                            block.att.w0,
+                            block.att.w1_proj,
+                            block.att.w2_proj,
+                            block.att.a0,
+                            block.att.a1_proj,
+                            block.att.a2_proj,
+                            block.att.v0,
+                            block.att.v1_proj,
+                            block.att.v2_proj,
+                            block.att.g1_proj,
+                            block.att.g2_proj,
+                            block.att.k_k,
+                            block.att.k_a,
+                            block.att.r_k,
+                            block.att.receptance_proj,
+                            block.att.key_proj,
+                            block.att.value_proj,
+                            block.att.output_proj,
+                            block.att.ln_x_weight,
+                            block.att.ln_x_bias,
+                            block.ln1.gamma,
+                            block.ln1.beta,
+                            block.ln1.eps,
+                            block.ln2.gamma,
+                            block.ln2.beta,
+                            block.ln2.eps,
+                            block.ffn.x_k,
+                            block.ffn.key_proj,
+                            block.ffn.value_proj,
+                            self.decode_tokenshift_scratch,
+                        )
                 v_first = v_first_seq
             else:
                 for block in self.blocks:
@@ -1348,6 +1650,92 @@ class RWKV7Model(nn.Module):
         x = self.ln_out(x)
         return x
 
+    def forward_one(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        context = get_context()
+        assert not context.is_prefill
+        if input_ids.dim() != 1 or input_ids.numel() != 1 or positions.dim() != 1 or positions.numel() != 1:
+            return self.forward(input_ids, positions)
+
+        if getattr(context, "force_contiguous_decode", False):
+            slot_in_start = int(getattr(context, "contiguous_decode_slot_in_start"))
+            slot_out_start = int(getattr(context, "contiguous_decode_slot_out_start"))
+            slot_count = int(getattr(context, "contiguous_decode_slot_count"))
+        else:
+            slot_mapping_in = context.slot_mapping_in
+            slot_mapping_out = context.slot_mapping_out
+            if (
+                slot_mapping_in is None
+                or slot_mapping_out is None
+                or slot_mapping_in.numel() != 1
+                or slot_mapping_out.numel() != 1
+                or not _is_contiguous_in_order(slot_mapping_in)
+                or not _is_contiguous_in_order(slot_mapping_out)
+            ):
+                return self.forward(input_ids, positions)
+            slot_in_start = int(slot_mapping_in[0].item())
+            slot_out_start = int(slot_mapping_out[0].item())
+            slot_count = 1
+
+        if slot_count != 1:
+            return self.forward(input_ids, positions)
+
+        x = self.emb(input_ids)
+        v_first = None
+        slot_in_end = slot_in_start + 1
+        slot_out_end = slot_out_start + 1
+        for block in self.blocks:
+            x, v_first = _rwkv7_decode_block_one_contiguous(
+                x,
+                block.att.att_tokenshift_cache[slot_in_start:slot_in_end],
+                block.att.att_tokenshift_cache[slot_out_start:slot_out_end],
+                block.att.state_cache[slot_in_start:slot_in_end],
+                block.att.state_cache[slot_out_start:slot_out_end],
+                block.ffn.ffn_tokenshift_cache[slot_in_start:slot_in_end],
+                block.ffn.ffn_tokenshift_cache[slot_out_start:slot_out_end],
+                positions,
+                v_first,
+                block.layer_idx,
+                block.att.num_heads,
+                block.att.head_dim,
+                block.att.x_r,
+                block.att.x_w,
+                block.att.x_k,
+                block.att.x_v,
+                block.att.x_a,
+                block.att.x_g,
+                block.att.w0,
+                block.att.w1_proj,
+                block.att.w2_proj,
+                block.att.a0,
+                block.att.a1_proj,
+                block.att.a2_proj,
+                block.att.v0,
+                block.att.v1_proj,
+                block.att.v2_proj,
+                block.att.g1_proj,
+                block.att.g2_proj,
+                block.att.k_k,
+                block.att.k_a,
+                block.att.r_k,
+                block.att.receptance_proj,
+                block.att.key_proj,
+                block.att.value_proj,
+                block.att.output_proj,
+                block.att.ln_x_weight,
+                block.att.ln_x_bias,
+                block.ln1.gamma,
+                block.ln1.beta,
+                block.ln1.eps,
+                block.ln2.gamma,
+                block.ln2.beta,
+                block.ln2.eps,
+                block.ffn.x_k,
+                block.ffn.key_proj,
+                block.ffn.value_proj,
+                self.decode_tokenshift_scratch,
+            )
+        return F.layer_norm(x, (self.ln_out.hidden_size,), self.ln_out.gamma, self.ln_out.beta, self.ln_out.eps)
+
     def load_pth(self, pth_path: str):
         """Load weights from RWKV pth file."""
         z = torch.load(pth_path, map_location='cpu')
@@ -1364,7 +1752,14 @@ class RWKV7Model(nn.Module):
                 or k.endswith('att.key.weight')
                 or k.endswith('att.value.weight')
                 or k.endswith('att.output.weight')
-                or k.endswith('ffn.key.weight')
+                or k.endswith('att.w1')
+                or k.endswith('att.w2')
+                or k.endswith('att.a1')
+                or k.endswith('att.a2')
+                or k.endswith('att.v1')
+                or k.endswith('att.v2')
+                or k.endswith('att.g1')
+                or k.endswith('att.g2')
                 or k.endswith('ffn.value.weight')
             ):
                 z[k] = z[k].t()
@@ -1483,6 +1878,14 @@ class RWKV7ForCausalLM(nn.Module):
 
     def forward_logits(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions)
+        if self.lm_head.tp_size == 1 and hidden_states.dim() == 2:
+            if self.lm_head.use_int8:
+                return self.lm_head(hidden_states)
+            return torch.matmul(hidden_states, self.lm_head.weight)
+        return self.lm_head(hidden_states)
+
+    def forward_one_logits(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.model.forward_one(input_ids, positions)
         if self.lm_head.tp_size == 1 and hidden_states.dim() == 2:
             if self.lm_head.use_int8:
                 return self.lm_head(hidden_states)

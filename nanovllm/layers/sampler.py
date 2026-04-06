@@ -9,6 +9,8 @@ class Sampler(nn.Module):
 
     @torch.compile
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
+        if temperatures is None:
+            return logits.argmax(dim=-1)
         if torch.all(temperatures <= 1e-10):
             return logits.argmax(dim=-1)
 

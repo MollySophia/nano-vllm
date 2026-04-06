@@ -22,11 +22,26 @@ def _preload_env_cuda_libs() -> list[str]:
         return []
 
     loaded: list[str] = []
+    lib_roots = [
+        nvidia_root / "cuda_runtime" / "lib",
+        nvidia_root / "cuda_nvrtc" / "lib",
+        nvidia_root / "cu13" / "lib",
+        nvidia_root / "cublas" / "lib",
+        nvidia_root / "cusparselt" / "lib",
+        nvidia_root / "cusparse" / "lib",
+        nvidia_root / "cusolver" / "lib",
+        nvidia_root / "nccl" / "lib",
+    ]
     candidates = [
         nvidia_root / "cuda_runtime" / "lib" / "libcudart.so.12",
         nvidia_root / "cuda_nvrtc" / "lib" / "libnvrtc.so.12",
+        nvidia_root / "cuda_nvrtc" / "lib" / "libnvrtc-builtins.so.12.8",
+        nvidia_root / "cu13" / "lib" / "libnvrtc.so.13",
+        nvidia_root / "cu13" / "lib" / "libnvrtc-builtins.so.13.0",
         nvidia_root / "cublas" / "lib" / "libcublasLt.so.12",
         nvidia_root / "cublas" / "lib" / "libcublas.so.12",
+        nvidia_root / "cublas" / "lib" / "libcublasLt.so.13",
+        nvidia_root / "cublas" / "lib" / "libcublas.so.13",
         nvidia_root / "cusparselt" / "lib" / "libcusparseLt.so.0",
         nvidia_root / "cusparse" / "lib" / "libcusparse.so.12",
         nvidia_root / "cusolver" / "lib" / "libcusolver.so.11",
@@ -144,21 +159,26 @@ class MatmulLinear(nn.Module):
         input_size: int,
         output_size: int,
         bias: bool = False,
+        weight_layout: str = "in_out",
     ):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
-        self.weight = nn.Parameter(torch.empty(input_size, output_size))
+        assert weight_layout in ("in_out", "out_in")
+        self.weight_layout = weight_layout
+        if weight_layout == "in_out":
+            self.weight = nn.Parameter(torch.empty(input_size, output_size))
+        else:
+            self.weight = nn.Parameter(torch.empty(output_size, input_size))
         if bias:
             self.bias = nn.Parameter(torch.empty(output_size))
         else:
             self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = torch.matmul(x, self.weight)
-        if self.bias is not None:
-            y = y + self.bias
-        return y
+        if self.weight_layout == "in_out":
+            return F.linear(x, self.weight.t(), self.bias)
+        return F.linear(x, self.weight, self.bias)
 
 
 def _int8_cublas_dequant_eager(
@@ -201,8 +221,19 @@ def _int8_per_channel_cublas_impl(
     if scales_fp16 is None:
         scales_fp16 = scales.to(torch.float16)
     if x2.shape[0] <= 16:
-        weight_fp16 = (qweight.to(torch.float16) * scales_fp16[:, None]).t().contiguous()
-        y = torch.matmul(x2, weight_fp16)
+        # torch._int_mm performs well for lm_head, but very small M can require
+        # padding. Avoid materializing a full fp16 dequantized weight matrix
+        # (~512 MiB for 7B vocab heads), which breaks bs=1 ping-pong graph use.
+        min_intmm_rows = 17
+        x_pad = torch.zeros((min_intmm_rows, k), device=x2.device, dtype=x2.dtype)
+        x_pad[:x2.shape[0]].copy_(x2)
+        x_int8, x_scale = _int8_cublas_quant(x_pad, act_scale)
+        y_int32 = torch._int_mm(x_int8, qweight.t())
+        y = (
+            y_int32.to(torch.float32)
+            * x_scale.to(torch.float32)
+            * scales_fp16.to(torch.float32)
+        ).to(torch.float16)[:x2.shape[0]]
     else:
         x_int8, x_scale = _int8_cublas_quant(x2, act_scale)
         y_int32 = torch._int_mm(x_int8, qweight.t())
@@ -256,12 +287,29 @@ class MarlinInt8Linear(nn.Module):
             self.register_parameter("bias", None)
 
     @torch.no_grad()
-    def quantize_from_weight(self, weight: torch.Tensor, bias: torch.Tensor | None = None):
+    def quantize_from_weight(
+        self,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        *,
+        weight_layout: str = "auto",
+    ):
         marlin = get_marlin_impl_or_raise()
         assert self.group_size == 128, "Minimal Marlin experiment only supports group_size=128."
-        assert weight.shape == (self.input_size, self.output_size)
-        # vLLM RTN/Marlin expects row-major [out, in].
-        weight_oi = weight.t().contiguous()
+        assert weight_layout in ("auto", "in_out", "out_in")
+        assert weight.shape in (
+            (self.input_size, self.output_size),
+            (self.output_size, self.input_size),
+        )
+        # vLLM RTN/Marlin expects row-major [out, in]. Square projections make
+        # shape-based inference ambiguous, so prefer the explicit module layout
+        # when available.
+        if weight_layout == "in_out":
+            weight_oi = weight.t().contiguous()
+        elif weight_layout == "out_in":
+            weight_oi = weight.contiguous()
+        else:
+            weight_oi = weight if weight.shape == (self.output_size, self.input_size) else weight.t().contiguous()
         q_u8, scales = marlin["rtn_quantize"](weight_oi, 8, self.group_size)
         q_packed, s_packed = marlin["repack_weights"](q_u8, scales, 8)
         self.qweight = q_packed.contiguous()
@@ -284,7 +332,11 @@ class MarlinInt8Linear(nn.Module):
             scale_dtype=module.weight.dtype if module.weight.dtype in (torch.float16, torch.bfloat16, torch.float32) else torch.float16,
         )
         bias = None if module.bias is None else module.bias.detach()
-        qmod.quantize_from_weight(module.weight.detach(), bias)
+        qmod.quantize_from_weight(
+            module.weight.detach(),
+            bias,
+            weight_layout=getattr(module, "weight_layout", "auto"),
+        )
         return qmod
 
     @property
@@ -293,8 +345,10 @@ class MarlinInt8Linear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         marlin = get_marlin_impl_or_raise()
-        return marlin["apply_rtn_marlin_linear"](
-            input=x,
+        orig_shape = x.shape[:-1]
+        x2 = x.reshape(-1, x.shape[-1])
+        y = marlin["apply_rtn_marlin_linear"](
+            input=x2,
             weight=self.qweight,
             weight_scale=self.scales,
             workspace=self.workspace,
@@ -303,6 +357,7 @@ class MarlinInt8Linear(nn.Module):
             input_size_per_partition=self.input_size,
             bias=self.bias,
         )
+        return y.reshape(*orig_shape, self.output_size)
 
 
 class ColumnParallelLinear(LinearBase):

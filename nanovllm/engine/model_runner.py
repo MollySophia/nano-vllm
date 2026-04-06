@@ -26,6 +26,14 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.eos = config.eos
+        self._bs1_decode_tensors = None
+        self._bs1_temperature = None
+        self._bs1_decode_graphs = {}
+        self._bs1_decode_graph_pool = None
+        self._bs1_decode_logits = None
+        self._bs1_next_token = None
+        self._bs1_decode_graph_attempted = set()
 
         if self.use_state_cache:
             # Handle both torch.dtype and string representations
@@ -384,6 +392,29 @@ class ModelRunner:
 
     def prepare_decode(self, seqs: list[Sequence]):
         if self.use_state_cache:
+            if len(seqs) == 1:
+                seq = seqs[0]
+                if self._bs1_decode_tensors is None:
+                    self._bs1_decode_tensors = dict(
+                        input_ids=torch.empty(1, dtype=torch.int64, device="cuda"),
+                        positions=torch.empty(1, dtype=torch.int64, device="cuda"),
+                        slot_mapping_in=torch.empty(1, dtype=torch.int32, device="cuda"),
+                        slot_mapping_out=torch.empty(1, dtype=torch.int32, device="cuda"),
+                        context_lens=torch.empty(1, dtype=torch.int32, device="cuda"),
+                    )
+                cached = self._bs1_decode_tensors
+                cached["input_ids"][0] = seq.last_token
+                cached["positions"][0] = len(seq) - 1
+                cached["slot_mapping_in"][0] = seq.block_table[0]
+                cached["slot_mapping_out"][0] = seq.block_table[0]
+                cached["context_lens"][0] = len(seq)
+                set_context(
+                    False,
+                    context_lens=cached["context_lens"],
+                    slot_mapping_in=cached["slot_mapping_in"],
+                    slot_mapping_out=cached["slot_mapping_out"],
+                )
+                return cached["input_ids"], cached["positions"]
             input_ids = []
             positions = []
             slot_mapping_in = []
@@ -421,7 +452,207 @@ class ModelRunner:
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
+    def prepare_decode_single(self, seq: Sequence):
+        input_ids, positions = self.prepare_decode([seq])
+        temperatures = self.prepare_sample([seq]) if self.rank == 0 else None
+        self._ensure_bs1_decode_graph(input_ids, positions, temperatures is None)
+        return input_ids, positions, temperatures
+
+    def _prepare_decode_single_slots(
+        self,
+        last_token: int,
+        position: int,
+        context_len: int,
+        slot_in: int,
+        slot_out: int,
+        temperature: float = 0.0,
+    ):
+        assert self.use_state_cache
+        if slot_in != slot_out:
+            # For bs=1, preserving the prefill state only matters on the first
+            # decode step. Copy once to the output slot, then keep decoding
+            # in-place on that slot instead of maintaining a true ping-pong path.
+            self._copy_bs1_decode_state(slot_in, slot_out)
+            slot_in = slot_out
+        if self._bs1_decode_tensors is None:
+            self._bs1_decode_tensors = dict(
+                input_ids=torch.empty(1, dtype=torch.int64, device="cuda"),
+                positions=torch.empty(1, dtype=torch.int64, device="cuda"),
+                slot_mapping_in=torch.empty(1, dtype=torch.int32, device="cuda"),
+                slot_mapping_out=torch.empty(1, dtype=torch.int32, device="cuda"),
+                context_lens=torch.empty(1, dtype=torch.int32, device="cuda"),
+            )
+        cached = self._bs1_decode_tensors
+        cached["input_ids"][0] = last_token
+        cached["positions"][0] = position
+        cached["slot_mapping_in"][0] = slot_in
+        cached["slot_mapping_out"][0] = slot_out
+        cached["context_lens"][0] = context_len
+        set_context(
+            False,
+            context_lens=cached["context_lens"],
+            slot_mapping_in=cached["slot_mapping_in"],
+            slot_mapping_out=cached["slot_mapping_out"],
+        )
+        temperatures = None
+        if self.rank == 0 and temperature > 1e-10:
+            if self._bs1_temperature is None:
+                self._bs1_temperature = torch.empty(1, dtype=torch.float32, device="cuda")
+            self._bs1_temperature[0] = temperature
+            temperatures = self._bs1_temperature
+        self._ensure_bs1_decode_graph(cached["input_ids"], cached["positions"], temperatures is None)
+        return cached["input_ids"], cached["positions"], temperatures
+
+    def _snapshot_bs1_decode_state(self, slot_in: int, slot_out: int):
+        slots = (slot_in,) if slot_in == slot_out else (slot_in, slot_out)
+        blocks = getattr(getattr(self.model, "model", None), "blocks", None)
+        if blocks is None:
+            return None
+        snapshots = []
+        for block in blocks:
+            att_snap = {slot: block.att.att_tokenshift_cache[slot].clone() for slot in slots}
+            state_snap = {slot: block.att.state_cache[slot].clone() for slot in slots}
+            ffn_snap = {slot: block.ffn.ffn_tokenshift_cache[slot].clone() for slot in slots}
+            snapshots.append((att_snap, state_snap, ffn_snap))
+        return snapshots
+
+    def _restore_bs1_decode_state(self, snapshots):
+        if snapshots is None:
+            return
+        for block, (att_snap, state_snap, ffn_snap) in zip(self.model.model.blocks, snapshots):
+            for slot, value in att_snap.items():
+                block.att.att_tokenshift_cache[slot].copy_(value)
+            for slot, value in state_snap.items():
+                block.att.state_cache[slot].copy_(value)
+            for slot, value in ffn_snap.items():
+                block.ffn.ffn_tokenshift_cache[slot].copy_(value)
+
+    def _copy_bs1_decode_state(self, slot_in: int, slot_out: int):
+        if slot_in == slot_out:
+            return
+        self.state_cache[:, slot_out].copy_(self.state_cache[:, slot_in])
+        self.token_shift_cache[:, :, slot_out].copy_(self.token_shift_cache[:, :, slot_in])
+
+    def _ensure_bs1_decode_graph(self, input_ids: torch.Tensor, positions: torch.Tensor, greedy_only: bool):
+        if not self.use_state_cache or self.world_size != 1:
+            return
+        cached = self._bs1_decode_tensors
+        if cached is None:
+            return
+        slot_in = int(cached["slot_mapping_in"][0].item())
+        slot_out = int(cached["slot_mapping_out"][0].item())
+        if greedy_only and (slot_in, slot_out, False) in self._bs1_decode_graphs:
+            return
+        key = (slot_in, slot_out, greedy_only)
+        if key in self._bs1_decode_graphs or key in self._bs1_decode_graph_attempted:
+            return
+        self._bs1_decode_graph_attempted.add(key)
+        state_snapshot = self._snapshot_bs1_decode_state(slot_in, slot_out)
+        with torch.inference_mode():
+            set_context(
+                False,
+                force_contiguous_decode=True,
+                contiguous_decode_slot_in_start=slot_in,
+                contiguous_decode_slot_out_start=slot_out,
+                contiguous_decode_slot_count=int(cached["slot_mapping_in"].numel()),
+                context_lens=cached["context_lens"],
+                slot_mapping_in=cached["slot_mapping_in"],
+                slot_mapping_out=cached["slot_mapping_out"],
+            )
+            try:
+                logits = self.model.forward_one_logits(input_ids, positions)
+                self._restore_bs1_decode_state(state_snapshot)
+                if self._bs1_next_token is None:
+                    self._bs1_next_token = torch.empty(1, dtype=torch.int64, device=input_ids.device)
+                if not greedy_only:
+                    self._bs1_decode_logits = logits.clone()
+                self._bs1_next_token.copy_(logits.argmax(dim=-1))
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=self._bs1_decode_graph_pool):
+                    logits = self.model.forward_one_logits(input_ids, positions)
+                    if not greedy_only:
+                        self._bs1_decode_logits.copy_(logits)
+                    self._bs1_next_token.copy_(logits.argmax(dim=-1))
+                self._bs1_decode_graphs[key] = graph
+                if self._bs1_decode_graph_pool is None:
+                    self._bs1_decode_graph_pool = graph.pool()
+                self._restore_bs1_decode_state(state_snapshot)
+            except Exception:
+                self._bs1_decode_graphs.pop(key, None)
+                self._restore_bs1_decode_state(state_snapshot)
+            finally:
+                set_context(
+                    False,
+                    context_lens=cached["context_lens"],
+                    slot_mapping_in=cached["slot_mapping_in"],
+                    slot_mapping_out=cached["slot_mapping_out"],
+                )
+
+    def decode_single_step(
+        self,
+        seq: Sequence,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        temperatures: torch.Tensor | None,
+        record_sequence: bool = True,
+    ):
+        cached = self._bs1_decode_tensors
+        slot_in = slot_out = None
+        if cached is not None:
+            slot_in = int(cached["slot_mapping_in"][0].item())
+            slot_out = int(cached["slot_mapping_out"][0].item())
+        graph_key = None
+        if slot_in is not None and slot_out is not None:
+            if temperatures is None:
+                if (slot_in, slot_out, True) in self._bs1_decode_graphs:
+                    graph_key = (slot_in, slot_out, True)
+                elif (slot_in, slot_out, False) in self._bs1_decode_graphs:
+                    graph_key = (slot_in, slot_out, False)
+            else:
+                if (slot_in, slot_out, False) in self._bs1_decode_graphs:
+                    graph_key = (slot_in, slot_out, False)
+        use_bs1_graph = graph_key is not None
+        if use_bs1_graph:
+            self._bs1_decode_graphs[graph_key].replay()
+            logits = None if graph_key[2] and temperatures is None else self._bs1_decode_logits
+        else:
+            logits = self.model.forward_one_logits(input_ids, positions)
+        if self.rank == 0:
+            if temperatures is None:
+                token = self._bs1_next_token if self._bs1_next_token is not None else logits.argmax(dim=-1)
+            else:
+                token = self.sampler(logits, temperatures)
+        else:
+            token = None
+        if self.rank == 0 and record_sequence:
+            token_id = int(token.item())
+            seq.append_token(token_id)
+            return token_id
+        return token
+
+    def run_decode_only_single(self, seq: Sequence, decode_steps: int) -> int:
+        input_ids, positions, temperatures = self.prepare_decode_single(seq)
+        next_token = torch.tensor([seq.last_token], device=input_ids.device, dtype=input_ids.dtype)
+        context_lens = self._bs1_decode_tensors["context_lens"]
+        steps = 0
+        while steps < decode_steps:
+            input_ids[0] = next_token[0]
+            next_token = self.decode_single_step(seq, input_ids, positions, temperatures, record_sequence=False)
+            positions.add_(1)
+            context_lens.add_(1)
+            steps += 1
+        reset_context()
+        return steps
+
     def prepare_sample(self, seqs: list[Sequence]):
+        if len(seqs) == 1:
+            if seqs[0].temperature <= 1e-10:
+                return None
+            if self._bs1_temperature is None:
+                self._bs1_temperature = torch.empty(1, dtype=torch.float32, device="cuda")
+            self._bs1_temperature[0] = seqs[0].temperature
+            return self._bs1_temperature
         temperatures = []
         for seq in seqs:
             temperatures.append(seq.temperature)
@@ -450,6 +681,14 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        if self.use_state_cache and not is_prefill and len(seqs) == 1:
+            seq = seqs[0]
+            input_ids, positions, temperatures = self.prepare_decode_single(seq)
+            token = self.decode_single_step(seq, input_ids, positions, temperatures, record_sequence=False)
+            reset_context()
+            if self.rank == 0:
+                return [int(token.item())]
+            return None
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
