@@ -21,17 +21,18 @@ def ensure_model_dir(model_pth: str) -> str:
     return model_dir
 
 
-def run_decode_only(
+def run_benchmark(
     model_pth: str,
     concurrency: int,
-    prompt_tokens: list[int],
+    prompt_length: int,
     decode_steps: int,
     gpu_memory_utilization: float,
     rwkv_prefill_token_budget: int,
     rwkv_prefill_max_batch_size: int,
     rwkv_quant_int8: bool,
     enforce_eager: bool,
-) -> tuple[int, int, int, float, float, float | None]:
+    seed: int,
+) -> tuple[int, int, int, int, float, float, float, float | None]:
     model_dir = ensure_model_dir(model_pth)
     # Prefill consumes the first sampled token, so request one extra token to leave
     # exactly `decode_steps` decode iterations after prefill.
@@ -42,22 +43,35 @@ def run_decode_only(
         enforce_eager=enforce_eager,
         tensor_parallel_size=1,
         max_num_seqs=requested_max_num_seqs,
-        max_num_batched_tokens=max(16384, requested_max_num_seqs * len(prompt_tokens)),
+        max_num_batched_tokens=max(16384, requested_max_num_seqs * prompt_length),
         max_model_len=8192,
         gpu_memory_utilization=gpu_memory_utilization,
         rwkv_prefill_token_budget=rwkv_prefill_token_budget,
         rwkv_prefill_max_batch_size=rwkv_prefill_max_batch_size,
         rwkv_quant_int8=rwkv_quant_int8,
     )
+    vocab_size = int(llm.model_runner.config.hf_config.vocab_size)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    prompt_tokens = torch.randint(0, vocab_size, (prompt_length,), generator=generator, dtype=torch.int64).tolist()
     if concurrency == -1:
         concurrency = llm.model_runner.config.num_state_blocks
     llm.model_runner.sampler.forward = lambda logits, temperatures: logits.argmax(dim=-1)
     for _ in range(concurrency):
         llm.add_request(prompt_tokens, sampling_params)
 
+    torch.cuda.synchronize()
+    prefill_t0 = time.perf_counter()
+    prefill_tokens = 0
     while llm.scheduler.waiting:
-        outputs, _ = llm.step()  # prefill only
+        outputs, num_tokens = llm.step()
         assert len(outputs) == 0
+        if num_tokens > 0:
+            prefill_tokens += num_tokens
+    torch.cuda.synchronize()
+    prefill_dt = time.perf_counter() - prefill_t0
+    prefill_tps = prefill_tokens / prefill_dt if prefill_dt > 0 else 0.0
+
     seqs = list(llm.scheduler.running)
     assert len(seqs) == concurrency, f"len(seqs) = {len(seqs)}, concurrency = {concurrency}, specified concurrency exceeded calculated memory limit"
 
@@ -80,15 +94,15 @@ def run_decode_only(
         torch.cuda.synchronize()
         loop_dt = time.perf_counter() - t1
         reset_context()
-        dt = time.perf_counter() - t0
+        decode_dt = time.perf_counter() - t0
         resident_blocks = llm.model_runner.config.num_state_blocks
         llm.model_runner.call("exit")
-        decode_tps = concurrency * steps / dt
+        decode_tps = concurrency * steps / decode_dt
         steady_decode_tps = concurrency * steps / loop_dt
-        return concurrency, resident_blocks, steps, dt, decode_tps, steady_decode_tps
+        return concurrency, resident_blocks, prefill_tokens, steps, prefill_dt, prefill_tps, decode_tps, steady_decode_tps
 
     torch.cuda.synchronize()
-    t0 = time.perf_counter()
+    decode_t0 = time.perf_counter()
     steps = 0
     while seqs:
         token_ids = llm.model_runner.call("run", seqs, False)
@@ -96,46 +110,59 @@ def run_decode_only(
         steps += 1
         seqs = list(llm.scheduler.running)
     torch.cuda.synchronize()
-    dt = time.perf_counter() - t0
+    decode_dt = time.perf_counter() - decode_t0
     resident_blocks = llm.model_runner.config.num_state_blocks
     llm.exit()
-    decode_tps = concurrency * steps / dt
-    return concurrency, resident_blocks, steps, dt, decode_tps, None
+    decode_tps = concurrency * steps / decode_dt
+    return concurrency, resident_blocks, prefill_tokens, steps, prefill_dt, prefill_tps, decode_tps, None
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-pth", required=True)
     parser.add_argument("--concurrency", type=int, nargs="+", default=[512, 768])
-    parser.add_argument("--prompt-tokens", type=int, nargs="+", default=[3645, 6579, 10737, 15388])
+    parser.add_argument("--prompt-length", type=int, default=4)
     parser.add_argument("--decode-steps", type=int, default=128)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.95)
     parser.add_argument("--rwkv-prefill-token-budget", type=int, default=2048)
     parser.add_argument("--rwkv-prefill-max-batch-size", type=int, default=128)
     parser.add_argument("--rwkv-quant-int8", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     for n in args.concurrency:
         torch.cuda.empty_cache()
-        actual_n, resident_blocks, steps, dt, decode_tps, steady_decode_tps = run_decode_only(
+        (
+            actual_n,
+            resident_blocks,
+            prefill_tokens,
+            steps,
+            prefill_dt,
+            prefill_tps,
+            decode_tps,
+            steady_decode_tps,
+        ) = run_benchmark(
             args.model_pth,
             n,
-            args.prompt_tokens,
+            args.prompt_length,
             args.decode_steps,
             args.gpu_memory_utilization,
             args.rwkv_prefill_token_budget,
             args.rwkv_prefill_max_batch_size,
             args.rwkv_quant_int8,
             args.enforce_eager,
+            args.seed,
         )
         summary = (
             f"gpu_memory_utilization={args.gpu_memory_utilization:.2f},"
             f"rwkv_prefill_token_budget={args.rwkv_prefill_token_budget},"
             f"rwkv_prefill_max_batch_size={args.rwkv_prefill_max_batch_size},"
             f"rwkv_quant_int8={int(args.rwkv_quant_int8)},"
-            f"n={actual_n},resident_blocks={resident_blocks},decode_steps={steps},"
-            f"time_s={dt:.4f},decode_tps={decode_tps:.2f}"
+            f"prompt_length={args.prompt_length},seed={args.seed},"
+            f"n={actual_n},resident_blocks={resident_blocks},"
+            f"prefill_tokens={prefill_tokens},prefill_time_s={prefill_dt:.4f},prefill_tps={prefill_tps:.2f},"
+            f"decode_steps={steps},decode_tps={decode_tps:.2f}"
         )
         if steady_decode_tps is not None:
             summary += f",steady_decode_tps={steady_decode_tps:.2f}"
