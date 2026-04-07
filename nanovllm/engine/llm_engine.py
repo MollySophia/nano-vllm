@@ -10,6 +10,7 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.tokenizers import get_rwkv_tokenizer
 
 
 class LLMEngine:
@@ -29,10 +30,9 @@ class LLMEngine:
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
-        # RWKV state-cache models typically don't ship a HF tokenizer config.
         if config.use_state_cache:
-            self.tokenizer = None
-            config.eos = getattr(config.hf_config, 'eos_token_id', 0)
+            self.tokenizer = get_rwkv_tokenizer()
+            config.eos = self.tokenizer.eos_token_id
         else:
             self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
             config.eos = self.tokenizer.eos_token_id
@@ -51,8 +51,6 @@ class LLMEngine:
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
-            if self.tokenizer is None:
-                raise ValueError("String prompts require a tokenizer. For RWKV pth models, please pass token ids (list[int]).")
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
@@ -99,10 +97,7 @@ class LLMEngine:
                 if use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        if self.tokenizer is not None:
-            outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
-        else:
-            outputs = [{"text": "", "token_ids": token_ids} for token_ids in outputs]
+        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         if use_tqdm:
             pbar.close()
         return outputs
