@@ -30,6 +30,8 @@ def run_benchmark(
     rwkv_prefill_token_budget: int,
     rwkv_prefill_max_batch_size: int,
     rwkv_quant_int8: bool,
+    rwkv_quant_int8_lm_head: bool,
+    rwkv_quant_int8_lm_head_marlin: bool,
     enforce_eager: bool,
     seed: int,
 ) -> tuple[int, int, int, int, float, float, float, float | None]:
@@ -49,6 +51,8 @@ def run_benchmark(
         rwkv_prefill_token_budget=rwkv_prefill_token_budget,
         rwkv_prefill_max_batch_size=rwkv_prefill_max_batch_size,
         rwkv_quant_int8=rwkv_quant_int8,
+        rwkv_quant_int8_lm_head=rwkv_quant_int8_lm_head,
+        rwkv_quant_int8_lm_head_marlin=rwkv_quant_int8_lm_head_marlin,
     )
     vocab_size = int(llm.model_runner.config.hf_config.vocab_size)
     generator = torch.Generator(device="cpu")
@@ -127,9 +131,12 @@ def main():
     parser.add_argument("--rwkv-prefill-token-budget", type=int, default=2048)
     parser.add_argument("--rwkv-prefill-max-batch-size", type=int, default=128)
     parser.add_argument("--rwkv-quant-int8", action="store_true")
+    parser.add_argument("--rwkv-int8-lm-head", action="store_true")
+    parser.add_argument("--rwkv-int8-lm-head-marlin", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    assert not (args.rwkv_int8_lm_head and args.rwkv_int8_lm_head_marlin)
 
     for n in args.concurrency:
         torch.cuda.empty_cache()
@@ -151,6 +158,8 @@ def main():
             args.rwkv_prefill_token_budget,
             args.rwkv_prefill_max_batch_size,
             args.rwkv_quant_int8,
+            args.rwkv_int8_lm_head or args.rwkv_int8_lm_head_marlin,
+            args.rwkv_int8_lm_head_marlin,
             args.enforce_eager,
             args.seed,
         )
@@ -159,6 +168,8 @@ def main():
             f"rwkv_prefill_token_budget={args.rwkv_prefill_token_budget},"
             f"rwkv_prefill_max_batch_size={args.rwkv_prefill_max_batch_size},"
             f"rwkv_quant_int8={int(args.rwkv_quant_int8)},"
+            f"rwkv_quant_int8_lm_head={int(args.rwkv_int8_lm_head or args.rwkv_int8_lm_head_marlin)},"
+            f"rwkv_quant_int8_lm_head_marlin={int(args.rwkv_int8_lm_head_marlin)},"
             f"prompt_length={args.prompt_length},seed={args.seed},"
             f"n={actual_n},resident_blocks={resident_blocks},"
             f"prefill_tokens={prefill_tokens},prefill_time_s={prefill_dt:.4f},prefill_tps={prefill_tps:.2f},"

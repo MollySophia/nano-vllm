@@ -12,6 +12,7 @@ class Config:
     rwkv_prefill_token_budget: int = 2048
     rwkv_prefill_max_batch_size: int = 128
     rwkv_quant_int8: bool = False
+    rwkv_quant_int8_lm_head: bool = False
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False

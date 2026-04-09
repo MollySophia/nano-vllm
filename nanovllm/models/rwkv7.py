@@ -1930,10 +1930,16 @@ class RWKV7ForCausalLM(nn.Module):
             shard_size = self.lm_head.num_embeddings_per_partition
             start_idx = self.lm_head.tp_rank * shard_size
             self.lm_head.weight.data.copy_(self.model.z['head.weight'].narrow(0, start_idx, shard_size).t().contiguous())
-        if getattr(self.config, "rwkv_quant_int8", False):
-            self.lm_head.quantize_weight_int8()
-            if 'head.weight' in self.model.z:
-                del self.model.z['head.weight']
+        if getattr(self.config, "rwkv_quant_int8", False) and (
+            getattr(self.config, "rwkv_quant_int8_lm_head", False)
+            or getattr(self.config, "rwkv_quant_int8_lm_head_marlin", False)
+        ):
+            if getattr(self.config, "rwkv_quant_int8_lm_head_marlin", False):
+                self.lm_head.quantize_weight_marlin_int8()
+            else:
+                self.lm_head.quantize_weight_int8()
+        if 'head.weight' in self.model.z:
+            del self.model.z['head.weight']
 
         gc.collect()
         if torch.cuda.is_available():
