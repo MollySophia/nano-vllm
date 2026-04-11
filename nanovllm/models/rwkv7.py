@@ -128,10 +128,10 @@ def _rwkv7_tmix_one_impl(
     xa = torch.addcmul(x, xx, x_a)
     xg = torch.addcmul(x, xx, x_g)
 
-    r = _matmul_linear(xr, receptance_weight)
+    r = F.linear(xr, receptance_weight)
     w = F.linear(torch.tanh(F.linear(xw, w1)), w2, bias=w0)
-    k = _matmul_linear(xk, key_weight)
-    v = _matmul_linear(xv, value_weight)
+    k = F.linear(xk, key_weight)
+    v = F.linear(xv, value_weight)
     a = torch.sigmoid(F.linear(F.linear(xa, a1), a2, bias=a0))
     g = F.linear(torch.sigmoid(F.linear(xg, g1)), g2)
     kk = F.normalize((k * k_k).view(-1, num_heads, head_dim), dim=-1, p=2.0).view_as(k)
@@ -165,7 +165,7 @@ def _rwkv7_tmix_one_post_impl(
     y = y + (
         ((r * k * r_k).view(-1, num_heads, head_dim).sum(dim=-1, keepdim=True) * v.view(-1, num_heads, head_dim)).view_as(r)
     )
-    return _matmul_linear(y * g, output_weight)
+    return F.linear(y * g, output_weight)
 
 
 def _rwkv7_ffn_decode_impl(
@@ -297,12 +297,18 @@ def _rwkv7_decode_block_batch_contiguous(
     decode_tokenshift_scratch: torch.Tensor,
 ):
     bsz, c = x.shape
+    att_inplace = att_tokenshift_cache_in.data_ptr() == att_tokenshift_cache_out.data_ptr()
+    ffn_inplace = ffn_tokenshift_cache_in.data_ptr() == ffn_tokenshift_cache_out.data_ptr()
     h = F.layer_norm(x, (c,), ln1_gamma, ln1_beta, ln1_eps)
-    h_cache = h.to(att_tokenshift_cache_out.dtype)
-    x_prev = decode_tokenshift_scratch[:bsz]
-    x_prev.copy_(att_tokenshift_cache_in)
-    att_tokenshift_cache_out.copy_(h_cache)
-    xx = x_prev - h
+    if att_inplace:
+        xx = att_tokenshift_cache_in.to(dtype=h.dtype) - h
+        att_tokenshift_cache_out.copy_(h)
+    else:
+        h_cache = h.to(att_tokenshift_cache_out.dtype)
+        x_prev = decode_tokenshift_scratch[:bsz]
+        x_prev.copy_(att_tokenshift_cache_in)
+        att_tokenshift_cache_out.copy_(h_cache)
+        xx = x_prev - h
     xr = torch.addcmul(h, xx, x_r)
     xw = torch.addcmul(h, xx, x_w)
     xk = torch.addcmul(h, xx, x_k)
@@ -346,11 +352,15 @@ def _rwkv7_decode_block_batch_contiguous(
     x.add_(y)
 
     h2 = F.layer_norm(x, (c,), ln2_gamma, ln2_beta, ln2_eps)
-    h2_cache = h2.to(ffn_tokenshift_cache_out.dtype)
-    x_prev_ffn = decode_tokenshift_scratch[:bsz]
-    x_prev_ffn.copy_(ffn_tokenshift_cache_in)
-    ffn_tokenshift_cache_out.copy_(h2_cache)
-    xx = x_prev_ffn - h2
+    if ffn_inplace:
+        xx = ffn_tokenshift_cache_in.to(dtype=h2.dtype) - h2
+        ffn_tokenshift_cache_out.copy_(h2)
+    else:
+        h2_cache = h2.to(ffn_tokenshift_cache_out.dtype)
+        x_prev_ffn = decode_tokenshift_scratch[:bsz]
+        x_prev_ffn.copy_(ffn_tokenshift_cache_in)
+        ffn_tokenshift_cache_out.copy_(h2_cache)
+        xx = x_prev_ffn - h2
     k_ffn = torch.addcmul(h2, xx, ffn_x_k)
     k_ffn = torch.relu(_linear_dispatch(k_ffn, ffn_key_proj)) ** 2
     x.add_(_linear_dispatch(k_ffn, ffn_value_proj))
@@ -935,10 +945,13 @@ class RWKV7Attention(nn.Module):
         # (not defined here to avoid conflict with register_buffer)
         self._cuda_kernel_ready = False
         self._cuda_kernel_attempted = False
-        self.receptance_proj = MatmulLinear(hidden_size, hidden_size)
-        self.key_proj = MatmulLinear(hidden_size, hidden_size)
-        self.value_proj = MatmulLinear(hidden_size, hidden_size)
-        self.output_proj = MatmulLinear(hidden_size, hidden_size)
+        # Keep square attention projections in F.linear-friendly [out, in]
+        # layout to match Albatross across bs=1, regular decode, and batched
+        # contiguous decode paths.
+        self.receptance_proj = MatmulLinear(hidden_size, hidden_size, weight_layout="out_in")
+        self.key_proj = MatmulLinear(hidden_size, hidden_size, weight_layout="out_in")
+        self.value_proj = MatmulLinear(hidden_size, hidden_size, weight_layout="out_in")
+        self.output_proj = MatmulLinear(hidden_size, hidden_size, weight_layout="out_in")
         self.w1_proj = MatmulLinear(hidden_size, 128, weight_layout="out_in")
         self.w2_proj = MatmulLinear(128, hidden_size, weight_layout="out_in")
         self.a1_proj = MatmulLinear(hidden_size, 128, weight_layout="out_in")
@@ -1040,7 +1053,7 @@ class RWKV7Attention(nn.Module):
         return self._forward_prefill_batch_right(x, slot_mapping_in, slot_mapping_out, v_first, att_mask)
 
     def _forward_prefill_batch_right(self, x: torch.Tensor, slot_mapping_in: torch.Tensor, slot_mapping_out: torch.Tensor, v_first: torch.Tensor | None = None, att_mask: torch.Tensor | None = None):
-        """Right-padded batch prefill: x is [batch, seqlen, hidden_size]."""
+        """Left-padded batch prefill: x is [batch, seqlen, hidden_size]."""
         B, T, C = x.shape
         H, N = self.num_heads, self.head_dim
         context = get_context()
@@ -1051,7 +1064,13 @@ class RWKV7Attention(nn.Module):
                 (T - context_lens).unsqueeze(1)
             ).unsqueeze(2)
 
-        x_prev = torch.cat((self.att_tokenshift_cache[slot_mapping_in].to(x.dtype).unsqueeze(1), x[:, :-1, :]), dim=1)
+        att_cache_in = self.att_tokenshift_cache[slot_mapping_in].to(x.dtype)
+        x_prev = torch.cat((att_cache_in.unsqueeze(1), x[:, :-1, :]), dim=1)
+        # Left padding means the first valid token is not adjacent to the
+        # previous valid token in x[:, :-1]. Restore the real token-shift
+        # boundary from cache for each row's first non-pad position.
+        starts = (T - context_lens).to(torch.long)
+        x_prev[torch.arange(B, device=x.device), starts] = att_cache_in
         xx = x_prev - x
         self.att_tokenshift_cache[slot_mapping_out] = x[:, -1, :].to(self.att_tokenshift_cache.dtype)
         xr = torch.addcmul(x, xx, self.x_r.view(1, 1, C))
@@ -1377,7 +1396,11 @@ class RWKV7FeedForward(nn.Module):
         """Varlen prefill"""
         if x.dim() == 3:
             B, T, _ = x.shape
-            x_prev = torch.cat((self.ffn_tokenshift_cache[slot_mapping_in].to(x.dtype).unsqueeze(1), x[:, :-1, :]), dim=1)
+            context_lens = get_context().context_lens
+            ffn_cache_in = self.ffn_tokenshift_cache[slot_mapping_in].to(x.dtype)
+            x_prev = torch.cat((ffn_cache_in.unsqueeze(1), x[:, :-1, :]), dim=1)
+            starts = (T - context_lens).to(torch.long)
+            x_prev[torch.arange(B, device=x.device), starts] = ffn_cache_in
             self.ffn_tokenshift_cache[slot_mapping_out] = x[:, -1, :].to(self.ffn_tokenshift_cache.dtype)
             xx = x_prev - x
             k = x + xx * self.x_k
@@ -1746,13 +1769,11 @@ class RWKV7Model(nn.Module):
 
         for k in keys:
             kk = k.split('.')
-            # Store RWKV projection weights in right-multiply [in, out] layout.
+            # Keep square attention projections in checkpoint/native F.linear
+            # [out, in] layout. Transpose the remaining projection weights into
+            # the module layout they expect.
             if (
-                k.endswith('att.receptance.weight')
-                or k.endswith('att.key.weight')
-                or k.endswith('att.value.weight')
-                or k.endswith('att.output.weight')
-                or k.endswith('att.w1')
+                k.endswith('att.w1')
                 or k.endswith('att.w2')
                 or k.endswith('att.a1')
                 or k.endswith('att.a2')

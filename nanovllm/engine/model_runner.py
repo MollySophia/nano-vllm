@@ -326,8 +326,32 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
+    def _reset_state_cache_slots_for_prefill(self, seqs: list[Sequence]) -> None:
+        if not self.use_state_cache or not seqs:
+            return
+        fresh_slots = sorted({
+            int(seq.block_table[0])
+            for seq in seqs
+            if seq.num_cached_tokens == 0 and seq.block_table
+        })
+        if not fresh_slots:
+            return
+        blocks = getattr(getattr(self.model, "model", None), "blocks", None)
+        if blocks is None or len(blocks) == 0:
+            return
+        slot_ids = torch.tensor(
+            fresh_slots,
+            dtype=torch.int64,
+            device=blocks[0].att.state_cache.device,
+        )
+        for block in blocks:
+            block.att.state_cache.index_fill_(0, slot_ids, 0)
+            block.att.att_tokenshift_cache.index_fill_(0, slot_ids, 0)
+            block.ffn.ffn_tokenshift_cache.index_fill_(0, slot_ids, 0)
+
     def prepare_prefill(self, seqs: list[Sequence]):
         if self.use_state_cache:
+            self._reset_state_cache_slots_for_prefill(seqs)
             input_rows = []
             position_rows = []
             slot_mapping_in = []
