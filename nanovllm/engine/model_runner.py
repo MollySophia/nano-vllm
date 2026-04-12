@@ -31,6 +31,8 @@ class ModelRunner:
         self._bs1_decode_logits = None
         self._bs1_next_token = None
         self._bs1_decode_graph_attempted = set()
+        self.state_slot_manager = None
+        self.prefix_index = None
 
         # Handle both torch.dtype and string representations
         dtype = model_config.torch_dtype
@@ -92,7 +94,7 @@ class ModelRunner:
                     except Exception:
                         pass
 
-            for attr in ("state_cache", "token_shift_cache", "model", "sampler"):
+            for attr in ("state_cache", "token_shift_cache", "slot_last_hidden", "slot_last_hidden_valid", "model", "sampler"):
                 if hasattr(self, attr):
                     try:
                         delattr(self, attr)
@@ -147,6 +149,10 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
+    def attach_state_cache(self, slot_manager, prefix_index):
+        self.state_slot_manager = slot_manager
+        self.prefix_index = prefix_index
+
     def allocate_state_cache(self):
         config = self.config
         model_config = config.model_config
@@ -165,7 +171,10 @@ class ModelRunner:
             free, total = torch.cuda.mem_get_info()
             reserve = total * (1 - config.gpu_memory_utilization)
             available = free - reserve - prefill_probe_bytes
-            return int(available) // block_bytes
+            num_blocks = int(available) // block_bytes
+            if config.max_state_slots != -1:
+                num_blocks = min(num_blocks, config.max_state_slots)
+            return num_blocks
 
         config.num_state_blocks = compute_num_state_blocks()
         if config.num_state_blocks <= 0:
@@ -180,6 +189,13 @@ class ModelRunner:
             )
         self.state_cache = torch.zeros(model_config.num_hidden_layers, config.num_state_blocks, num_heads, head_dim, head_dim)
         self.token_shift_cache = torch.zeros(2, model_config.num_hidden_layers, config.num_state_blocks, model_config.hidden_size)
+        if config.rwkv_state_cache_enable:
+            self.slot_last_hidden = torch.zeros(config.num_state_blocks, model_config.hidden_size)
+            self.slot_last_hidden_valid = torch.zeros(config.num_state_blocks, dtype=torch.bool)
+        else:
+            for attr in ("slot_last_hidden", "slot_last_hidden_valid"):
+                if hasattr(self, attr):
+                    delattr(self, attr)
         self.bind_state_cache_modules(self.state_cache, self.token_shift_cache)
         target_model = getattr(self.model, "model", self.model)
         if hasattr(target_model, "decode_tokenshift_scratch"):
@@ -250,7 +266,11 @@ class ModelRunner:
         seqs = []
         for block_id in range(batch_size):
             seq = Sequence([0] * prompt_len)
-            seq.block_table = [block_id]
+            if self.config.rwkv_state_cache_enable:
+                seq.prompt_cache_slot = block_id
+                seq.cached_prefix_len = 0
+            else:
+                seq.block_table = [block_id]
             seqs.append(seq)
         input_ids, positions = self.prepare_prefill(seqs)
         torch.cuda.synchronize()
@@ -272,11 +292,18 @@ class ModelRunner:
     def _reset_state_cache_slots_for_prefill(self, seqs: list[Sequence]) -> None:
         if not seqs:
             return
-        fresh_slots = sorted({
-            int(seq.block_table[0])
-            for seq in seqs
-            if seq.num_cached_tokens == 0 and seq.block_table
-        })
+        if self.config.rwkv_state_cache_enable:
+            fresh_slots = sorted({
+                int(seq.prompt_cache_slot)
+                for seq in seqs
+                if seq.cached_prefix_len == 0 and seq.prompt_cache_slot is not None
+            })
+        else:
+            fresh_slots = sorted({
+                int(seq.block_table[0])
+                for seq in seqs
+                if seq.num_cached_tokens == 0 and seq.block_table
+            })
         if not fresh_slots:
             return
         blocks = getattr(getattr(self.model, "model", None), "blocks", None)
@@ -291,6 +318,17 @@ class ModelRunner:
             block.att.state_cache.index_fill_(0, slot_ids, 0)
             block.att.att_tokenshift_cache.index_fill_(0, slot_ids, 0)
             block.ffn.ffn_tokenshift_cache.index_fill_(0, slot_ids, 0)
+        if hasattr(self, "slot_last_hidden"):
+            self.slot_last_hidden.index_fill_(0, slot_ids, 0)
+        if hasattr(self, "slot_last_hidden_valid"):
+            self.slot_last_hidden_valid.index_fill_(0, slot_ids, False)
+
+    def _seq_slot_for_decode(self, seq: Sequence) -> int:
+        if self.config.rwkv_state_cache_enable:
+            assert seq.state_slot is not None
+            return int(seq.state_slot)
+        assert seq.block_table
+        return int(seq.block_table[0])
 
     def prepare_prefill(self, seqs: list[Sequence]):
         self._reset_state_cache_slots_for_prefill(seqs)
@@ -299,17 +337,29 @@ class ModelRunner:
         slot_mapping_in = []
         slot_mapping_out = []
         context_lens = []
-        max_seqlen = max(len(seq) - seq.num_cached_tokens for seq in seqs)
+        if self.config.rwkv_state_cache_enable:
+            max_seqlen = max(seq.num_prompt_tokens - seq.cached_prefix_len for seq in seqs)
+        else:
+            max_seqlen = max(len(seq) - seq.num_cached_tokens for seq in seqs)
         for seq in seqs:
-            new_token_ids = seq[seq.num_cached_tokens:]
+            if self.config.rwkv_state_cache_enable:
+                new_token_ids = seq.prompt_token_ids[seq.cached_prefix_len:]
+                start_pos = seq.cached_prefix_len
+                slot_in = seq.cache_hit_slot if seq.cache_hit_slot is not None else seq.prompt_cache_slot
+                slot_out = seq.prompt_cache_slot
+            else:
+                new_token_ids = seq[seq.num_cached_tokens:]
+                start_pos = 0
+                block_id = seq.block_table[0] if seq.block_table else 0
+                slot_in = block_id
+                slot_out = block_id
             seqlen = len(new_token_ids)
             pad_len = max_seqlen - seqlen
             input_rows.append([0] * pad_len + new_token_ids)
-            position_rows.append([0] * pad_len + list(range(seqlen)))
+            position_rows.append([0] * pad_len + list(range(start_pos, start_pos + seqlen)))
             context_lens.append(seqlen)
-            block_id = seq.block_table[0] if seq.block_table else 0
-            slot_mapping_in.append(block_id)
-            slot_mapping_out.append(block_id)
+            slot_mapping_in.append(slot_in)
+            slot_mapping_out.append(slot_out)
         input_ids = torch.tensor(input_rows, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(position_rows, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping_in = torch.tensor(slot_mapping_in, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -321,6 +371,7 @@ class ModelRunner:
     def prepare_decode(self, seqs: list[Sequence]):
         if len(seqs) == 1:
             seq = seqs[0]
+            self._ensure_bs1_decode_tensors_mutable()
             if self._bs1_decode_tensors is None:
                 self._bs1_decode_tensors = dict(
                     input_ids=torch.empty(1, dtype=torch.int64, device="cuda"),
@@ -332,8 +383,14 @@ class ModelRunner:
             cached = self._bs1_decode_tensors
             cached["input_ids"][0] = seq.last_token
             cached["positions"][0] = len(seq) - 1
-            cached["slot_mapping_in"][0] = seq.block_table[0]
-            cached["slot_mapping_out"][0] = seq.block_table[0]
+            if self.config.rwkv_state_cache_enable and not seq.state_slot_materialized:
+                assert seq.prompt_cache_slot is not None and seq.state_slot is not None
+                cached["slot_mapping_in"][0] = int(seq.prompt_cache_slot)
+                cached["slot_mapping_out"][0] = int(seq.state_slot)
+            else:
+                slot_id = self._seq_slot_for_decode(seq)
+                cached["slot_mapping_in"][0] = slot_id
+                cached["slot_mapping_out"][0] = slot_id
             cached["context_lens"][0] = len(seq)
             set_context(
                 False,
@@ -351,9 +408,14 @@ class ModelRunner:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
-            block_id = seq.block_table[0]
-            slot_mapping_in.append(block_id)
-            slot_mapping_out.append(block_id)
+            if self.config.rwkv_state_cache_enable and not seq.state_slot_materialized:
+                assert seq.prompt_cache_slot is not None and seq.state_slot is not None
+                slot_mapping_in.append(int(seq.prompt_cache_slot))
+                slot_mapping_out.append(int(seq.state_slot))
+            else:
+                slot_id = self._seq_slot_for_decode(seq)
+                slot_mapping_in.append(slot_id)
+                slot_mapping_out.append(slot_id)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping_in = torch.tensor(slot_mapping_in, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -376,8 +438,10 @@ class ModelRunner:
         slot_in: int,
         slot_out: int,
         temperature: float = 0.0,
+        copy_input_state: bool = True,
+        prepare_graph: bool = True,
     ):
-        if slot_in != slot_out:
+        if copy_input_state and slot_in != slot_out:
             # For bs=1, preserving the prefill state only matters on the first
             # decode step. Copy once to the output slot, then keep decoding
             # in-place on that slot instead of maintaining a true ping-pong path.
@@ -409,7 +473,8 @@ class ModelRunner:
                 self._bs1_temperature = torch.empty(1, dtype=torch.float32, device="cuda")
             self._bs1_temperature[0] = temperature
             temperatures = self._bs1_temperature
-        self._ensure_bs1_decode_graph(cached["input_ids"], cached["positions"], temperatures is None)
+        if prepare_graph:
+            self._ensure_bs1_decode_graph(cached["input_ids"], cached["positions"], temperatures is None)
         return cached["input_ids"], cached["positions"], temperatures
 
     def _snapshot_bs1_decode_state(self, slot_in: int, slot_out: int):
@@ -441,6 +506,109 @@ class ModelRunner:
             return
         self.state_cache[:, slot_out].copy_(self.state_cache[:, slot_in])
         self.token_shift_cache[:, :, slot_out].copy_(self.token_shift_cache[:, :, slot_in])
+
+    def _ensure_bs1_decode_tensors_mutable(self) -> None:
+        if self._bs1_decode_tensors is None:
+            return
+        sample = next(iter(self._bs1_decode_tensors.values()))
+        is_inference = getattr(sample, "is_inference", None)
+        if callable(is_inference) and is_inference():
+            self._bs1_decode_tensors = {name: tensor.clone() for name, tensor in self._bs1_decode_tensors.items()}
+
+    def _invalidate_bs1_slot_graphs(self, slot_id: int) -> None:
+        keys = [key for key in self._bs1_decode_graphs if key[0] == slot_id and key[1] == slot_id]
+        for key in keys:
+            self._bs1_decode_graphs.pop(key, None)
+        attempted = [key for key in self._bs1_decode_graph_attempted if key[0] == slot_id and key[1] == slot_id]
+        for key in attempted:
+            self._bs1_decode_graph_attempted.discard(key)
+
+    def _copy_slot_states(self, slot_ins: list[int], slot_outs: list[int], copy_last_hidden: bool = False):
+        if not slot_ins:
+            return
+        if len(slot_ins) == 1:
+            src = int(slot_ins[0])
+            dst = int(slot_outs[0])
+            if src != dst:
+                self.state_cache[:, dst].copy_(self.state_cache[:, src])
+                self.token_shift_cache[:, :, dst].copy_(self.token_shift_cache[:, :, src])
+                if copy_last_hidden:
+                    self.slot_last_hidden[dst].copy_(self.slot_last_hidden[src])
+                    self.slot_last_hidden_valid[dst] = self.slot_last_hidden_valid[src]
+            return
+        src_index = torch.tensor(slot_ins, dtype=torch.int64, device=self.state_cache.device)
+        dst_index = torch.tensor(slot_outs, dtype=torch.int64, device=self.state_cache.device)
+        state = self.state_cache.index_select(1, src_index)
+        token_shift = self.token_shift_cache.index_select(2, src_index)
+        self.state_cache.index_copy_(1, dst_index, state)
+        self.token_shift_cache.index_copy_(2, dst_index, token_shift)
+        if copy_last_hidden:
+            last_hidden = self.slot_last_hidden.index_select(0, src_index)
+            last_hidden_valid = self.slot_last_hidden_valid.index_select(0, src_index)
+            self.slot_last_hidden.index_copy_(0, dst_index, last_hidden)
+            self.slot_last_hidden_valid.index_copy_(0, dst_index, last_hidden_valid)
+
+    def _store_slot_last_hidden(self, slot_id: int, hidden: torch.Tensor) -> None:
+        self.slot_last_hidden[slot_id].copy_(hidden)
+        self.slot_last_hidden_valid[slot_id] = True
+
+    def _publish_cached_slot(self, slot_id: int, token_ids: list[int], prefix_len: int, hidden: torch.Tensor) -> None:
+        self._store_slot_last_hidden(slot_id, hidden)
+        if self.rank != 0 or self.state_slot_manager is None or self.prefix_index is None:
+            return
+        cache_key = self.prefix_index.insert(token_ids, prefix_len, slot_id)
+        self.state_slot_manager.mark_cached(slot_id, cache_key, prefix_len)
+
+    def _would_finish_after_token(self, seq: Sequence, token_id: int) -> bool:
+        return ((not seq.ignore_eos and token_id == self.eos) or (seq.num_completion_tokens + 1 == seq.max_tokens))
+
+    def _forward_hidden_one_token(
+        self,
+        token_id: int,
+        position: int,
+        context_len: int,
+        slot_in: int,
+        slot_out: int | None = None,
+    ) -> torch.Tensor:
+        if slot_out is None:
+            slot_out = slot_in
+        input_ids, positions, _ = self._prepare_decode_single_slots(
+            last_token=token_id,
+            position=position,
+            context_len=context_len,
+            slot_in=slot_in,
+            slot_out=slot_out,
+            copy_input_state=False,
+            prepare_graph=False,
+        )
+        try:
+            hidden = self.model.model.forward_one(input_ids, positions)
+        finally:
+            reset_context()
+        return hidden
+
+    def _finalize_finished_sequence_cache(self, seq: Sequence, token_id: int) -> None:
+        if seq.state_slot is None:
+            return
+        if seq.state_slot_materialized:
+            slot_in = int(seq.state_slot)
+            slot_out = int(seq.state_slot)
+        else:
+            assert seq.prompt_cache_slot is not None
+            slot_in = int(seq.prompt_cache_slot)
+            slot_out = int(seq.state_slot)
+        hidden = self._forward_hidden_one_token(token_id, len(seq), len(seq) + 1, slot_in, slot_out)
+        if not seq.state_slot_materialized:
+            if self.rank == 0 and self.state_slot_manager is not None and seq.prompt_cache_slot is not None:
+                self.state_slot_manager.unpin_cached(seq.prompt_cache_slot)
+            seq.state_slot_materialized = True
+        self._publish_cached_slot(
+            seq.state_slot,
+            seq.token_ids + [token_id],
+            len(seq) + 1,
+            hidden[0],
+        )
+        seq.final_cache_published = True
 
     def _ensure_bs1_decode_graph(self, input_ids: torch.Tensor, positions: torch.Tensor, greedy_only: bool):
         if self.world_size != 1:
@@ -572,8 +740,123 @@ class ModelRunner:
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         return self.model.forward_logits(input_ids, positions)
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    @torch.inference_mode()
+    def _compute_prefill_logits_with_state_cache(self, seqs: list[Sequence]) -> torch.Tensor:
+        seq_to_row: dict[int, torch.Tensor] = {}
+        exact_seqs = [seq for seq in seqs if seq.exact_cache_hit]
+        prefill_seqs = [seq for seq in seqs if not seq.exact_cache_hit]
+
+        if prefill_seqs:
+            input_ids, positions = self.prepare_prefill(prefill_seqs)
+            hidden_states = self.model(input_ids, positions)
+            logits = self.model.compute_logits(hidden_states)
+            last_hidden = hidden_states[:, -1, :]
+            for row, seq in enumerate(prefill_seqs):
+                self._publish_cached_slot(seq.prompt_cache_slot, seq.prompt_token_ids, seq.num_prompt_tokens, last_hidden[row])
+                seq_to_row[seq.seq_id] = logits[row]
+                seq.state_slot_materialized = False
+                if self.rank == 0 and self.state_slot_manager is not None and seq.prompt_cache_slot is not None:
+                    self.state_slot_manager.pin_cached(seq.prompt_cache_slot)
+                if self.rank == 0 and self.state_slot_manager is not None and seq.cache_hit_slot is not None:
+                    self.state_slot_manager.unpin_cached(seq.cache_hit_slot)
+                    seq.cache_hit_slot = None
+
+        if exact_seqs:
+            valid = self.slot_last_hidden_valid.index_select(
+                0,
+                torch.tensor([int(seq.prompt_cache_slot) for seq in exact_seqs], dtype=torch.int64, device=self.state_cache.device),
+            )
+            if not bool(valid.all().item()):
+                raise RuntimeError("Exact RWKV cache hit is missing slot_last_hidden.")
+            hidden = self.slot_last_hidden.index_select(
+                0,
+                torch.tensor([int(seq.prompt_cache_slot) for seq in exact_seqs], dtype=torch.int64, device=self.state_cache.device),
+            )
+            logits = self.model.compute_logits(hidden)
+            for row, seq in enumerate(exact_seqs):
+                seq_to_row[seq.seq_id] = logits[row]
+                seq.state_slot_materialized = False
+
+        ordered_logits = torch.stack([seq_to_row[seq.seq_id] for seq in seqs], dim=0)
+        reset_context()
+        return ordered_logits
+
+    @torch.inference_mode()
+    def _compute_decode_logits_with_state_cache(self, seqs: list[Sequence]) -> torch.Tensor:
+        if len(seqs) == 1:
+            seq = seqs[0]
+            if not seq.state_slot_materialized:
+                assert seq.prompt_cache_slot is not None and seq.state_slot is not None
+                input_ids, positions, _ = self._prepare_decode_single_slots(
+                    last_token=seq.last_token,
+                    position=len(seq) - 1,
+                    context_len=len(seq),
+                    slot_in=int(seq.prompt_cache_slot),
+                    slot_out=int(seq.state_slot),
+                    copy_input_state=False,
+                    prepare_graph=False,
+                )
+            else:
+                input_ids, positions = self.prepare_decode([seq])
+            logits = self.model.forward_one_logits(input_ids, positions)
+            if not seq.state_slot_materialized:
+                if self.rank == 0 and self.state_slot_manager is not None and seq.prompt_cache_slot is not None:
+                    self.state_slot_manager.unpin_cached(seq.prompt_cache_slot)
+                self._invalidate_bs1_slot_graphs(int(seq.state_slot))
+                seq.state_slot_materialized = True
+            reset_context()
+            return logits
+        input_ids, positions = self.prepare_decode(seqs)
+        logits = self.run_model(input_ids, positions, False)
+        for seq in seqs:
+            if seq.state_slot_materialized:
+                continue
+            if self.rank == 0 and self.state_slot_manager is not None and seq.prompt_cache_slot is not None:
+                self.state_slot_manager.unpin_cached(seq.prompt_cache_slot)
+            self._invalidate_bs1_slot_graphs(int(seq.state_slot))
+            seq.state_slot_materialized = True
+        reset_context()
+        return logits
+
+    @torch.inference_mode()
+    def run_logits(self, seqs: list[Sequence], is_prefill: bool):
+        if self.config.rwkv_state_cache_enable:
+            if is_prefill:
+                return self._compute_prefill_logits_with_state_cache(seqs)
+            return self._compute_decode_logits_with_state_cache(seqs)
         if not is_prefill and len(seqs) == 1:
+            seq = seqs[0]
+            input_ids, positions = self.prepare_decode([seq])
+            logits = self.model.forward_one_logits(input_ids, positions)
+            reset_context()
+            return logits
+        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        logits = self.run_model(input_ids, positions, is_prefill)
+        reset_context()
+        return logits
+
+    def prepare_postprocess(self, seqs: list[Sequence], token_ids: list[int] | None) -> None:
+        if token_ids is None or self.rank != 0 or not self.config.rwkv_state_cache_enable:
+            return
+        for seq, token_id in zip(seqs, token_ids):
+            if self._would_finish_after_token(seq, token_id):
+                self._finalize_finished_sequence_cache(seq, token_id)
+
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        if self.config.rwkv_state_cache_enable and not is_prefill and len(seqs) == 1:
+            seq = seqs[0]
+            if seq.state_slot_materialized:
+                input_ids, positions, temperatures = self.prepare_decode_single(seq)
+                token = self.decode_single_step(seq, input_ids, positions, temperatures, record_sequence=False)
+                token_ids = [int(token.item())] if self.rank == 0 else None
+            else:
+                logits = self._compute_decode_logits_with_state_cache([seq])
+                temperatures = self.prepare_sample([seq]) if self.rank == 0 else None
+                token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            self.prepare_postprocess(seqs, token_ids)
+            reset_context()
+            return token_ids
+        if not self.config.rwkv_state_cache_enable and not is_prefill and len(seqs) == 1:
             seq = seqs[0]
             input_ids, positions, temperatures = self.prepare_decode_single(seq)
             token = self.decode_single_step(seq, input_ids, positions, temperatures, record_sequence=False)
@@ -581,9 +864,8 @@ class ModelRunner:
             if self.rank == 0:
                 return [int(token.item())]
             return None
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        logits = self.run_logits(seqs, is_prefill)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        reset_context()
+        self.prepare_postprocess(seqs, token_ids)
         return token_ids

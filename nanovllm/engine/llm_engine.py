@@ -33,6 +33,8 @@ class LLMEngine:
         self.tokenizer = get_rwkv_tokenizer()
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        if config.rwkv_state_cache_enable:
+            self.model_runner.attach_state_cache(self.scheduler.slot_manager, self.scheduler.prefix_index)
         atexit.register(self.exit)
 
     def exit(self):

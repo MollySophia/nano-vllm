@@ -23,6 +23,13 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
         self.block_table = []
+        self.state_slot: int | None = None
+        self.prompt_cache_slot: int | None = None
+        self.cache_hit_slot: int | None = None
+        self.cached_prefix_len = 0
+        self.exact_cache_hit = False
+        self.final_cache_published = False
+        self.state_slot_materialized = False
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -55,11 +62,34 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
+        return (
+                self.num_tokens,
+                self.num_prompt_tokens,
+                self.num_cached_tokens,
+                self.block_table,
+                self.state_slot,
+                self.prompt_cache_slot,
+                self.cache_hit_slot,
+                self.cached_prefix_len,
+                self.exact_cache_hit,
+                self.final_cache_published,
+                self.state_slot_materialized,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
+        (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.block_table,
+            self.state_slot,
+            self.prompt_cache_slot,
+            self.cache_hit_slot,
+            self.cached_prefix_len,
+            self.exact_cache_hit,
+            self.final_cache_published,
+            self.state_slot_materialized,
+        ) = state[:-1]
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
         else:

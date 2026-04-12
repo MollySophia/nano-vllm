@@ -91,18 +91,18 @@ def eval_chunk_decode_only(llm: LLM, runner, chunk: list[SampleState]) -> tuple[
         assert is_prefill
         for seq in seqs:
             sample_map[seq.seq_id] = chunk[len(sample_map)]
-        input_ids, positions = runner.prepare_prefill(seqs)
-        logits = runner.run_model(input_ids, positions, True)
+        logits = runner.call("run_logits", seqs, is_prefill)
         gold_tokens = score_logits(logits, seqs, sample_map, 0)
+        runner.call("prepare_postprocess", seqs, gold_tokens)
         llm.scheduler.postprocess(seqs, gold_tokens)
 
     while llm.scheduler.running:
         seqs, is_prefill = llm.scheduler.schedule()
         assert not is_prefill
-        input_ids, positions = runner.prepare_decode(seqs)
-        logits = runner.run_model(input_ids, positions, False)
+        logits = runner.call("run_logits", seqs, is_prefill)
         target_idx = seqs[0].num_completion_tokens
         gold_tokens = score_logits(logits, seqs, sample_map, target_idx)
+        runner.call("prepare_postprocess", seqs, gold_tokens)
         llm.scheduler.postprocess(seqs, gold_tokens)
 
     return len(chunk), total_target_tokens
@@ -119,18 +119,18 @@ def eval_chunk_prefill_then_decode(llm: LLM, runner, chunk: list[SampleState]) -
         assert is_prefill and len(seqs) == 1
         seq = seqs[0]
         sample_map[seq.seq_id] = sample
-        input_ids, positions = runner.prepare_prefill(seqs)
-        logits = runner.run_model(input_ids, positions, True)
+        logits = runner.call("run_logits", seqs, is_prefill)
         gold_tokens = score_logits(logits, seqs, sample_map, 0)
+        runner.call("prepare_postprocess", seqs, gold_tokens)
         llm.scheduler.postprocess(seqs, gold_tokens)
 
     while llm.scheduler.running:
         seqs, is_prefill = llm.scheduler.schedule()
         assert not is_prefill
-        input_ids, positions = runner.prepare_decode(seqs)
-        logits = runner.run_model(input_ids, positions, False)
+        logits = runner.call("run_logits", seqs, is_prefill)
         target_idx = seqs[0].num_completion_tokens
         gold_tokens = score_logits(logits, seqs, sample_map, target_idx)
+        runner.call("prepare_postprocess", seqs, gold_tokens)
         llm.scheduler.postprocess(seqs, gold_tokens)
 
     return len(chunk), total_target_tokens
@@ -144,8 +144,10 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--pad-eod", action="store_true")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.97)
+    parser.add_argument("--max-state-slots", type=int, default=-1)
     parser.add_argument("--rwkv-prefill-token-budget", type=int, default=2048)
     parser.add_argument("--rwkv-prefill-max-batch-size", type=int, default=128)
+    parser.add_argument("--rwkv-state-cache-enable", action="store_true")
     add_rwkv_int8_cli_args(parser)
     parser.add_argument("--print-interval", type=int, default=1000)
     parser.add_argument(
@@ -182,8 +184,10 @@ def main():
         max_num_batched_tokens=max(16384, args.batch_size * 32),
         max_model_len=8192,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        max_state_slots=args.max_state_slots,
         rwkv_prefill_token_budget=args.rwkv_prefill_token_budget,
         rwkv_prefill_max_batch_size=args.rwkv_prefill_max_batch_size,
+        rwkv_state_cache_enable=args.rwkv_state_cache_enable,
         rwkv_quant_int8=args.rwkv_quant_int8,
         rwkv_int8_fp16_lm_head=args.rwkv_int8_fp16_lm_head,
     )

@@ -169,8 +169,7 @@ def evaluate_chunk(
         seqs, is_prefill = llm.scheduler.schedule()
         assert is_prefill
         batch_samples = [pending.popleft() for _ in seqs]
-        input_ids, positions = runner.prepare_prefill(seqs)
-        logits = runner.run_model(input_ids, positions, True)
+        logits = runner.call("run_logits", seqs, is_prefill)
         batch_choice_token_ids = choice_token_ids.to(device=logits.device)
         choice_logits = logits.index_select(1, batch_choice_token_ids)
         predicted = choice_logits.argmax(dim=-1)
@@ -180,6 +179,7 @@ def evaluate_chunk(
             sample.predicted = int(predicted[row].item())
             sample.is_correct = sample.predicted == sample.answer
 
+        runner.call("prepare_postprocess", seqs, dummy_tokens)
         llm.scheduler.postprocess(seqs, dummy_tokens)
 
     assert not llm.scheduler.running
@@ -196,8 +196,10 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--subject", action="append", default=None)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.97)
+    parser.add_argument("--max-state-slots", type=int, default=-1)
     parser.add_argument("--rwkv-prefill-token-budget", type=int, default=2048)
     parser.add_argument("--rwkv-prefill-max-batch-size", type=int, default=128)
+    parser.add_argument("--rwkv-state-cache-enable", action="store_true")
     add_rwkv_int8_cli_args(parser)
     parser.add_argument("--print-interval", type=int, default=512)
     parser.add_argument("--predictions-path", default=None)
@@ -255,8 +257,10 @@ def main():
         max_num_batched_tokens=max(16384, args.batch_size * max_prompt_tokens),
         max_model_len=8192,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        max_state_slots=args.max_state_slots,
         rwkv_prefill_token_budget=args.rwkv_prefill_token_budget,
         rwkv_prefill_max_batch_size=args.rwkv_prefill_max_batch_size,
+        rwkv_state_cache_enable=args.rwkv_state_cache_enable,
         rwkv_quant_int8=args.rwkv_quant_int8,
         rwkv_int8_fp16_lm_head=args.rwkv_int8_fp16_lm_head,
     )

@@ -14,6 +14,8 @@ class Config:
     max_model_len: int = 4096
     rwkv_prefill_token_budget: int = 2048
     rwkv_prefill_max_batch_size: int = 128
+    rwkv_state_cache_enable: bool = False
+    max_state_slots: int = -1
     rwkv_quant_int8: bool = False
     rwkv_int8_fp16_lm_head: bool = False
     gpu_memory_utilization: float = 0.9
@@ -27,6 +29,9 @@ class Config:
         assert os.path.isdir(self.model) or os.path.isfile(self.model)
         assert 1 <= self.tensor_parallel_size <= 8
         assert self.rwkv_prefill_token_budget > 0
+        assert self.max_state_slots == -1 or self.max_state_slots > 0, "max_state_slots must be -1 or a positive integer."
+        if self.rwkv_state_cache_enable:
+            assert self.tensor_parallel_size == 1, "RWKV state cache is currently only wired for tensor_parallel_size=1."
         (
             self.rwkv_quant_int8_lm_head,
             self.rwkv_quant_int8_lm_head_marlin,
