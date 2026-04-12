@@ -2,77 +2,42 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
-import sys
-import os
-import ctypes
-import sysconfig
-from pathlib import Path
 from functools import lru_cache
+
+from nanovllm.ops.marlin import ensure_loaded as ensure_marlin_loaded
+from nanovllm.ops.marlin_utils import (
+    apply_rtn_marlin_linear,
+    marlin_make_workspace_new,
+    repack_weights,
+    rtn_quantize,
+    scalar_types,
+    verify_marlin_supports_shape,
+)
 
 def divide(numerator, denominator):
     assert numerator % denominator == 0
     return numerator // denominator
 
 
-@lru_cache(maxsize=1)
-def _preload_env_cuda_libs() -> list[str]:
-    purelib = Path(sysconfig.get_paths().get("purelib", ""))
-    nvidia_root = purelib / "nvidia"
-    if not nvidia_root.exists():
-        return []
-
-    loaded: list[str] = []
-    lib_roots = [
-        nvidia_root / "cuda_runtime" / "lib",
-        nvidia_root / "cuda_nvrtc" / "lib",
-        nvidia_root / "cu13" / "lib",
-        nvidia_root / "cublas" / "lib",
-        nvidia_root / "cusparselt" / "lib",
-        nvidia_root / "cusparse" / "lib",
-        nvidia_root / "cusolver" / "lib",
-        nvidia_root / "nccl" / "lib",
-    ]
-    candidates = [
-        nvidia_root / "cuda_runtime" / "lib" / "libcudart.so.12",
-        nvidia_root / "cuda_nvrtc" / "lib" / "libnvrtc.so.12",
-        nvidia_root / "cuda_nvrtc" / "lib" / "libnvrtc-builtins.so.12.8",
-        nvidia_root / "cu13" / "lib" / "libnvrtc.so.13",
-        nvidia_root / "cu13" / "lib" / "libnvrtc-builtins.so.13.0",
-        nvidia_root / "cublas" / "lib" / "libcublasLt.so.12",
-        nvidia_root / "cublas" / "lib" / "libcublas.so.12",
-        nvidia_root / "cublas" / "lib" / "libcublasLt.so.13",
-        nvidia_root / "cublas" / "lib" / "libcublas.so.13",
-        nvidia_root / "cusparselt" / "lib" / "libcusparseLt.so.0",
-        nvidia_root / "cusparse" / "lib" / "libcusparse.so.12",
-        nvidia_root / "cusolver" / "lib" / "libcusolver.so.11",
-        nvidia_root / "nccl" / "lib" / "libnccl.so.2",
-    ]
-    for lib in candidates:
-        if not lib.exists():
-            continue
-        ctypes.CDLL(str(lib), mode=ctypes.RTLD_GLOBAL)
-        loaded.append(str(lib))
-    return loaded
+_MARLIN_IMPL_ERROR: Exception | None = None
 
 
 @lru_cache(maxsize=1)
 def _get_marlin_impl():
+    global _MARLIN_IMPL_ERROR
     try:
-        _preload_env_cuda_libs()
-        from vllm.model_executor.layers.quantization.rtn import rtn_quantize, repack_weights
-        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-            apply_rtn_marlin_linear,
-            marlin_make_workspace_new,
-        )
-        from vllm.scalar_type import scalar_types
+        ensure_marlin_loaded()
+        _MARLIN_IMPL_ERROR = None
         return {
             "rtn_quantize": rtn_quantize,
             "repack_weights": repack_weights,
             "apply_rtn_marlin_linear": apply_rtn_marlin_linear,
             "marlin_make_workspace_new": marlin_make_workspace_new,
             "scalar_types": scalar_types,
+            "verify_marlin_supports_shape": verify_marlin_supports_shape,
         }
-    except Exception:
+    except Exception as exc:
+        _MARLIN_IMPL_ERROR = exc
         return None
 
 
@@ -80,33 +45,10 @@ def get_marlin_impl_or_raise():
     marlin = _get_marlin_impl()
     if marlin is not None:
         return marlin
-    current_python = Path(sys.executable).resolve()
-    current_prefix = current_python.parent.parent
-    site_packages = next((p for p in sys.path if "site-packages" in p), "")
-    cuda_lib_root = Path(site_packages) / "nvidia" if site_packages else None
-    cuda_libs = []
-    if cuda_lib_root is not None and cuda_lib_root.exists():
-        for rel in (
-            "cuda_runtime/lib",
-            "cu13/lib",
-            "cuda_nvrtc/lib",
-            "cublas/lib",
-            "cusparse/lib",
-            "cusparselt/lib",
-            "cusolver/lib",
-            "nccl/lib",
-        ):
-            lib_path = cuda_lib_root / rel
-            if lib_path.exists():
-                cuda_libs.append(str(lib_path))
-    ld_hint = ":".join(cuda_libs) if cuda_libs else "<python-env>/lib/pythonX.Y/site-packages/nvidia/.../lib"
     raise RuntimeError(
-        "Marlin runtime is unavailable. rwkv_quant_int8 now requires Marlin and no longer falls back. "
-        f"Current python: {current_python}. Current prefix: {current_prefix}. "
-        "Use the Python interpreter from the environment where vLLM/Marlin is installed. "
-        "The loader already tries to preload CUDA libs from the active environment; if that still fails, set "
-        f"LD_LIBRARY_PATH to include that environment's NVIDIA CUDA runtime libraries, e.g. {ld_hint}. "
-        f"Current LD_LIBRARY_PATH={os.environ.get('LD_LIBRARY_PATH', '')!r}"
+        "Local Marlin runtime is unavailable. "
+        "rwkv_quant_int8 now requires the vendored Marlin sources to JIT build successfully. "
+        f"Original error: {_MARLIN_IMPL_ERROR!r}"
     )
 
 
@@ -310,15 +252,32 @@ class MarlinInt8Linear(nn.Module):
             weight_oi = weight.contiguous()
         else:
             weight_oi = weight if weight.shape == (self.output_size, self.input_size) else weight.t().contiguous()
+        marlin["verify_marlin_supports_shape"](
+            self.output_size,
+            self.input_size,
+            self.input_size,
+            self.group_size,
+        )
         q_u8, scales = marlin["rtn_quantize"](weight_oi, 8, self.group_size)
         q_packed, s_packed = marlin["repack_weights"](q_u8, scales, 8)
         self.qweight = q_packed.contiguous()
         self.scales = s_packed.to(self.scale_dtype).contiguous()
         self.workspace = marlin["marlin_make_workspace_new"](weight.device, 4)
-        if self.bias is not None and bias is not None:
-            self.bias.data.copy_(bias)
-        elif self.bias is not None:
-            self.bias.data.zero_()
+        if self.bias is not None:
+            target_dtype = (
+                bias.dtype
+                if bias is not None
+                else (weight.dtype if weight.dtype in (torch.float16, torch.bfloat16) else torch.float16)
+            )
+            if self.bias.device != weight.device or self.bias.dtype != target_dtype:
+                self.bias = nn.Parameter(
+                    torch.empty(self.output_size, device=weight.device, dtype=target_dtype),
+                    requires_grad=False,
+                )
+            if bias is not None:
+                self.bias.data.copy_(bias.to(device=weight.device, dtype=target_dtype))
+            else:
+                self.bias.data.zero_()
         return self
 
     @classmethod
@@ -329,7 +288,7 @@ class MarlinInt8Linear(nn.Module):
             module.output_size,
             bias=module.bias is not None,
             group_size=128,
-            scale_dtype=module.weight.dtype if module.weight.dtype in (torch.float16, torch.bfloat16, torch.float32) else torch.float16,
+            scale_dtype=module.weight.dtype if module.weight.dtype in (torch.float16, torch.bfloat16) else torch.float16,
         )
         bias = None if module.bias is None else module.bias.detach()
         qmod.quantize_from_weight(

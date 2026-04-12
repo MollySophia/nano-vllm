@@ -1,5 +1,3 @@
-import os
-import sys
 import math
 import gc
 from typing import Optional
@@ -14,7 +12,6 @@ from nanovllm.layers.linear import (
     MatmulLinear,
     MarlinInt8Linear,
     get_marlin_impl_or_raise,
-    _preload_env_cuda_libs,
 )
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.utils.context import get_context
@@ -26,8 +23,6 @@ from nanovllm.ops.rwkv7_cuda import (
     wkv7_seq as wkv7_seq_cuda,
     wkv7_seq_batch as wkv7_seq_batch_cuda,
 )
-
-_preload_env_cuda_libs()
 
 
 # Constants for w transformation (from Albatross CUDA kernel)

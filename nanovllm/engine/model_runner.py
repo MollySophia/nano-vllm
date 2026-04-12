@@ -7,7 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.layers.linear import MarlinInt8Linear, _int8_per_channel_cublas
+from nanovllm.layers.linear import MarlinInt8Linear
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.rwkv7 import RWKV7ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -256,9 +256,9 @@ class ModelRunner:
                     warmed = True
             lm_head = getattr(self.model, "lm_head", None)
             if lm_head is not None and getattr(lm_head, "use_int8", False):
-                in_features = lm_head.qweight.shape[1]
+                in_features = self.config.hf_config.hidden_size
                 x = torch.zeros((1, in_features), device=lm_head.qweight.device, dtype=dtype)
-                _ = _int8_per_channel_cublas(x, lm_head.qweight, lm_head.scales, lm_head.scales_fp16, None)
+                _ = lm_head(x)
                 warmed = True
         if warmed:
             torch.cuda.synchronize()
