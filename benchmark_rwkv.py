@@ -9,6 +9,7 @@ from nanovllm import LLM, SamplingParams
 from nanovllm.utils.rwkv_int8 import (
     add_rwkv_int8_cli_args,
     describe_rwkv_int8_mode,
+    normalize_rwkv_int8_lm_head_flags,
     resolve_rwkv_int8_lm_head_flags,
 )
 from nanovllm.utils.context import reset_context
@@ -44,7 +45,7 @@ def run_benchmark(
     (
         rwkv_quant_int8_lm_head,
         rwkv_quant_int8_lm_head_marlin,
-    ) = resolve_rwkv_int8_lm_head_flags(
+    ) = normalize_rwkv_int8_lm_head_flags(
         rwkv_quant_int8=rwkv_quant_int8,
         rwkv_int8_fp16_lm_head=rwkv_int8_fp16_lm_head,
         rwkv_int8_lm_head=rwkv_quant_int8_lm_head,
@@ -70,7 +71,7 @@ def run_benchmark(
         rwkv_quant_int8_lm_head=rwkv_quant_int8_lm_head,
         rwkv_quant_int8_lm_head_marlin=rwkv_quant_int8_lm_head_marlin,
     )
-    vocab_size = int(llm.model_runner.config.hf_config.vocab_size)
+    vocab_size = int(llm.model_runner.config.model_config.vocab_size)
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
     prompt_tokens = torch.randint(0, vocab_size, (prompt_length,), generator=generator, dtype=torch.int64).tolist()
