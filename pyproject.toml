@@ -26,3 +26,4 @@ include = ["nanovllm*"]
 
 [tool.setuptools.package-data]
 "nanovllm.tokenizers" = ["*.txt"]
+"nanovllm" = ["eval_data/*.jsonl", "eval_data/mmlu_test_dataset/*"]

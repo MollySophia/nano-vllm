@@ -47,6 +47,26 @@ See `bench.py` for benchmark.
 
 The RWKV benchmark and evaluation scripts in this repo are the current reference workflow.
 
+## Tests
+
+The default test flow now prepares the local comparison checkout and then runs the unit tests:
+
+```bash
+python scripts/run_tests.py
+```
+
+For a fast local rerun without refreshing the external checkout:
+
+```bash
+python scripts/run_tests.py --skip-prepare-test-env
+```
+
+To refresh only the external comparison checkout:
+
+```bash
+python scripts/prepare_test_env.py
+```
+
 
 ## Star History
 

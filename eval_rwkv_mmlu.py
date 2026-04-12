@@ -9,8 +9,6 @@ from dataclasses import dataclass
 
 import torch
 
-ROOT = os.path.dirname(__file__)
-
 from nanovllm import LLM, SamplingParams  # noqa: E402
 from nanovllm.tokenizers import get_rwkv_tokenizer  # noqa: E402
 from nanovllm.utils.rwkv_int8 import (  # noqa: E402
@@ -28,8 +26,12 @@ else:
     DATASETS_IMPORT_ERROR = None
 
 
-DEFAULT_MMLU = os.path.join(ROOT, "eval", "mmlu_test_dataset")
-FALLBACK_MMLU = os.path.join(ROOT, "Albatross-better", "eval", "mmlu_test_dataset")
+DEFAULT_MMLU = os.path.join(
+    os.path.dirname(__file__),
+    "nanovllm",
+    "eval_data",
+    "mmlu_test_dataset",
+)
 TEMPLATE = """User: You are a very talented expert in <SUBJECT>. Answer this question:
 <Q>
 A. <|A|>
@@ -69,8 +71,6 @@ def ensure_model_dir(model_pth: str) -> str:
 def resolve_mmlu_path(path: str) -> str:
     if os.path.isdir(path):
         return path
-    if path == DEFAULT_MMLU and os.path.isdir(FALLBACK_MMLU):
-        return FALLBACK_MMLU
     raise SystemExit(f"MMLU dataset path does not exist: {path}")
 
 
@@ -79,7 +79,7 @@ def require_datasets() -> None:
         return
     raise SystemExit(
         "eval_rwkv_mmlu.py requires the HuggingFace `datasets` package because it "
-        "loads the same on-disk MMLU dataset format as Albatross. "
+        "loads a local on-disk MMLU dataset snapshot. "
         "Install it in the active environment and rerun.\n"
         f"Original import error: {DATASETS_IMPORT_ERROR}"
     )

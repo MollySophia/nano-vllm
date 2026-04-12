@@ -8,8 +8,6 @@ from dataclasses import dataclass
 
 import torch
 
-ROOT = os.path.dirname(__file__)
-
 from nanovllm import LLM, SamplingParams  # noqa: E402
 from nanovllm.tokenizers import RWKVTokenizer, get_rwkv_tokenizer
 from nanovllm.utils.rwkv_int8 import (  # noqa: E402
@@ -19,7 +17,12 @@ from nanovllm.utils.rwkv_int8 import (  # noqa: E402
 )
 
 
-DEFAULT_LAMBADA = os.path.join(ROOT, "Albatross-better", "eval", "lambada_test.jsonl")
+DEFAULT_LAMBADA = os.path.join(
+    os.path.dirname(__file__),
+    "nanovllm",
+    "eval_data",
+    "lambada_test.jsonl",
+)
 
 
 def ensure_model_dir(model_pth: str) -> str:

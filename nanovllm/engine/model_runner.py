@@ -10,7 +10,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.linear import MarlinInt8Linear
 from nanovllm.models.rwkv7 import RWKV7ForCausalLM
-from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.sampler import GREEDY_TEMPERATURE_EPS, Sampler
 from nanovllm.utils.context import set_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -61,7 +61,10 @@ class ModelRunner:
         self.model.config = config
         torch.set_default_device("cuda")
         load_model(self.model, config.model)
-        self.sampler = Sampler()
+        self.sampler = Sampler(
+            temperature_bucket_resolution=config.sampling_bucket_temperature_resolution,
+            top_p_bucket_resolution=config.sampling_bucket_top_p_resolution,
+        )
         # Allocate cache before warmup for RWKV (state cache is required for forward)
         self.allocate_state_cache()
         torch.set_default_device("cpu")
@@ -468,7 +471,7 @@ class ModelRunner:
             slot_mapping_out=cached["slot_mapping_out"],
         )
         temperatures = None
-        if self.rank == 0 and temperature > 1e-10:
+        if self.rank == 0 and temperature > GREEDY_TEMPERATURE_EPS:
             if self._bs1_temperature is None:
                 self._bs1_temperature = torch.empty(1, dtype=torch.float32, device="cuda")
             self._bs1_temperature[0] = temperature
@@ -699,7 +702,7 @@ class ModelRunner:
             if temperatures is None:
                 token = self._bs1_next_token if self._bs1_next_token is not None else logits.argmax(dim=-1)
             else:
-                token = self.sampler(logits, temperatures)
+                token = self.sampler(logits, [seq])
         else:
             token = None
         if self.rank == 0 and record_sequence:
@@ -724,7 +727,7 @@ class ModelRunner:
 
     def prepare_sample(self, seqs: list[Sequence]):
         if len(seqs) == 1:
-            if seqs[0].temperature <= 1e-10:
+            if seqs[0].temperature <= GREEDY_TEMPERATURE_EPS:
                 return None
             if self._bs1_temperature is None:
                 self._bs1_temperature = torch.empty(1, dtype=torch.float32, device="cuda")
@@ -851,8 +854,7 @@ class ModelRunner:
                 token_ids = [int(token.item())] if self.rank == 0 else None
             else:
                 logits = self._compute_decode_logits_with_state_cache([seq])
-                temperatures = self.prepare_sample([seq]) if self.rank == 0 else None
-                token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+                token_ids = self.sampler(logits, [seq]).tolist() if self.rank == 0 else None
             self.prepare_postprocess(seqs, token_ids)
             reset_context()
             return token_ids
@@ -865,7 +867,6 @@ class ModelRunner:
                 return [int(token.item())]
             return None
         logits = self.run_logits(seqs, is_prefill)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = self.sampler(logits, seqs).tolist() if self.rank == 0 else None
         self.prepare_postprocess(seqs, token_ids)
         return token_ids

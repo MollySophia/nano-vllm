@@ -20,3 +20,10 @@ def load_model(model, path: str):
     if not hasattr(model, "load_pth"):
         raise ValueError("Only RWKV models with load_pth() are supported.")
     model.load_pth(resolve_model_pth(path))
+    # `weight_loader` is only needed during checkpoint load. Leaving the bound
+    # method attached on Parameters keeps module objects alive via a Python
+    # reference cycle (`Parameter -> bound method -> module`), which in turn
+    # pins GPU weights across sequential benchmark runs.
+    for param in model.parameters():
+        if hasattr(param, "weight_loader"):
+            delattr(param, "weight_loader")

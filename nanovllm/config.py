@@ -16,6 +16,8 @@ class Config:
     rwkv_prefill_max_batch_size: int = 128
     rwkv_state_cache_enable: bool = False
     max_state_slots: int = -1
+    sampling_bucket_temperature_resolution: float = 0.0
+    sampling_bucket_top_p_resolution: float = 0.0
     rwkv_quant_int8: bool = False
     rwkv_int8_fp16_lm_head: bool = False
     gpu_memory_utilization: float = 0.9
@@ -30,6 +32,8 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8
         assert self.rwkv_prefill_token_budget > 0
         assert self.max_state_slots == -1 or self.max_state_slots > 0, "max_state_slots must be -1 or a positive integer."
+        assert self.sampling_bucket_temperature_resolution >= 0.0, "sampling_bucket_temperature_resolution must be non-negative."
+        assert self.sampling_bucket_top_p_resolution >= 0.0, "sampling_bucket_top_p_resolution must be non-negative."
         if self.rwkv_state_cache_enable:
             assert self.tensor_parallel_size == 1, "RWKV state cache is currently only wired for tensor_parallel_size=1."
         (

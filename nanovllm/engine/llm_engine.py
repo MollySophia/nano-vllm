@@ -51,6 +51,7 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
+        seq.allow_sparse_penalty_state = True
         self.scheduler.add(seq)
 
     def step(self):

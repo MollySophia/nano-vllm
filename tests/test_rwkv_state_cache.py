@@ -31,6 +31,25 @@ def _seq(token_ids: list[int], max_tokens: int = 4) -> Sequence:
 
 
 class RWKVStateCacheTest(unittest.TestCase):
+    def test_prefix_index_reinsert_same_slot_replaces_old_key(self):
+        index = StatePrefixIndex()
+
+        old_key = index.insert([1, 2], 2, 0)
+        self.assertEqual(old_key, (1, 2))
+        old_hit = index.lookup([1, 2, 9])
+        self.assertIsNotNone(old_hit)
+        self.assertEqual(old_hit.slot_id, 0)
+        self.assertEqual(old_hit.prefix_len, 2)
+
+        new_key = index.insert([3, 4], 2, 0)
+        self.assertEqual(new_key, (3, 4))
+        self.assertIsNone(index.lookup([1, 2, 9]))
+
+        new_hit = index.lookup([3, 4, 5])
+        self.assertIsNotNone(new_hit)
+        self.assertEqual(new_hit.slot_id, 0)
+        self.assertEqual(new_hit.prefix_len, 2)
+
     def test_slot_manager_lru_skips_pinned_slot(self):
         slots = StateSlotManager(2)
         index = StatePrefixIndex()
@@ -90,6 +109,36 @@ class RWKVStateCacheTest(unittest.TestCase):
         self.assertNotEqual(scheduled.prompt_cache_slot, source.slot_id)
         self.assertNotEqual(scheduled.state_slot, source.slot_id)
         self.assertNotEqual(scheduled.state_slot, scheduled.prompt_cache_slot)
+
+    def test_scheduler_preempt_releases_live_slots_and_unpins_cache_hit(self):
+        scheduler = Scheduler(_config())
+        source = scheduler.slot_manager.allocate_writable_slot(requires_zero_init=True)
+        cache_key = scheduler.prefix_index.insert([1, 2, 3], 3, source.slot_id)
+        scheduler.slot_manager.mark_cached(source.slot_id, cache_key, 3)
+
+        seq = _seq([1, 2, 3, 4])
+        scheduler.add(seq)
+        seqs, is_prefill = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        scheduled = seqs[0]
+        prompt_slot = scheduled.prompt_cache_slot
+        state_slot = scheduled.state_slot
+        cache_hit_slot = scheduled.cache_hit_slot
+        self.assertEqual(scheduler.slot_manager.slot_meta[cache_hit_slot].state.name, "CACHED_PINNED")
+
+        scheduler.preempt(scheduled)
+
+        self.assertEqual(scheduler.slot_manager.slot_meta[cache_hit_slot].state.name, "CACHED_EVICTABLE")
+        self.assertEqual(scheduler.slot_manager.slot_meta[prompt_slot].state.name, "FREE")
+        self.assertEqual(scheduler.slot_manager.slot_meta[state_slot].state.name, "FREE")
+        self.assertIsNone(seq.state_slot)
+        self.assertIsNone(seq.prompt_cache_slot)
+        self.assertIsNone(seq.cache_hit_slot)
+        self.assertEqual(seq.cached_prefix_len, 0)
+        self.assertEqual(seq.num_cached_tokens, 0)
+        self.assertFalse(seq.exact_cache_hit)
+        self.assertFalse(seq.state_slot_materialized)
 
 
 if __name__ == "__main__":

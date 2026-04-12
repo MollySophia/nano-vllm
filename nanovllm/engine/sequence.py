@@ -14,7 +14,9 @@ class SequenceStatus(Enum):
 class Sequence:
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+    def __init__(self, token_ids: list[int], sampling_params: SamplingParams | None = None):
+        if sampling_params is None:
+            sampling_params = SamplingParams()
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
@@ -31,8 +33,15 @@ class Sequence:
         self.final_cache_published = False
         self.state_slot_materialized = False
         self.temperature = sampling_params.temperature
+        self.top_k = sampling_params.top_k
+        self.top_p = sampling_params.top_p
+        self.presence_penalty = sampling_params.presence_penalty
+        self.repetition_penalty = sampling_params.repetition_penalty
+        self.penalty_decay = sampling_params.penalty_decay
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.penalty_state: dict[int, float] = {}
+        self.allow_sparse_penalty_state = False
 
     def __len__(self):
         return self.num_tokens
@@ -74,6 +83,16 @@ class Sequence:
                 self.exact_cache_hit,
                 self.final_cache_published,
                 self.state_slot_materialized,
+                self.temperature,
+                self.top_k,
+                self.top_p,
+                self.presence_penalty,
+                self.repetition_penalty,
+                self.penalty_decay,
+                self.max_tokens,
+                self.ignore_eos,
+                self.penalty_state,
+                self.allow_sparse_penalty_state,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
     def __setstate__(self, state):
@@ -89,8 +108,19 @@ class Sequence:
             self.exact_cache_hit,
             self.final_cache_published,
             self.state_slot_materialized,
+            self.temperature,
+            self.top_k,
+            self.top_p,
+            self.presence_penalty,
+            self.repetition_penalty,
+            self.penalty_decay,
+            self.max_tokens,
+            self.ignore_eos,
+            self.penalty_state,
+            self.allow_sparse_penalty_state,
         ) = state[:-1]
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
+            self.last_token = self.token_ids[-1]
         else:
             self.last_token = state[-1]
