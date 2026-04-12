@@ -53,6 +53,30 @@ def resolve_rwkv_int8_lm_head_flags(
     return True, True
 
 
+def normalize_rwkv_int8_lm_head_flags(
+    *,
+    rwkv_quant_int8: bool,
+    rwkv_int8_fp16_lm_head: bool = False,
+    rwkv_int8_lm_head: bool = False,
+    rwkv_int8_lm_head_marlin: bool = False,
+) -> tuple[bool, bool]:
+    if not rwkv_quant_int8:
+        if rwkv_int8_fp16_lm_head or rwkv_int8_lm_head or rwkv_int8_lm_head_marlin:
+            raise ValueError("RWKV int8 lm_head flags require rwkv_quant_int8=True.")
+        return False, False
+
+    if rwkv_int8_fp16_lm_head:
+        if rwkv_int8_lm_head or rwkv_int8_lm_head_marlin:
+            raise ValueError("RWKV int8 fp16 lm_head is incompatible with int8 lm_head flags.")
+        return False, False
+
+    if rwkv_int8_lm_head_marlin:
+        return True, True
+    if rwkv_int8_lm_head:
+        return True, False
+    return True, True
+
+
 def describe_rwkv_int8_mode(
     *,
     rwkv_quant_int8: bool,
