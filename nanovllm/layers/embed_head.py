@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from nanovllm.utils.context import get_context
-from nanovllm.layers.linear import _int8_per_channel_cublas, get_marlin_impl_or_raise
+from nanovllm.layers.linear import get_marlin_impl_or_raise
 
 
 @torch.jit.ignore
@@ -69,11 +69,9 @@ class ParallelLMHead(VocabParallelEmbedding):
         self.weight.weight_loader = self.weight_loader
         self.register_buffer("qweight", None)
         self.register_buffer("scales", None)
-        self.register_buffer("scales_fp16", None)
         self.register_buffer("workspace", None)
         self.group_size = 128
         self.use_int8 = False
-        self.use_int8_marlin = False
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -85,9 +83,7 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, x: torch.Tensor):
         if self.tp_size == 1 and x.dim() == 2:
             if self.use_int8:
-                if self.use_int8_marlin:
-                    return self._forward_marlin(x)
-                return _int8_per_channel_cublas(x, self.qweight, self.scales, self.scales_fp16, None)
+                return self._forward_marlin(x)
             return F.linear(x, self.weight.t())
         context = get_context()
         if context.is_prefill:
@@ -97,10 +93,7 @@ class ParallelLMHead(VocabParallelEmbedding):
                 last_indices = context.cu_seqlens_q[1:] - 1
                 x = x[last_indices].contiguous()
         if self.use_int8:
-            if self.use_int8_marlin:
-                logits = self._forward_marlin(x)
-            else:
-                logits = _int8_per_channel_cublas(x, self.qweight, self.scales, self.scales_fp16, None)
+            logits = self._forward_marlin(x)
         else:
             logits = F.linear(x, self.weight.t())
         if self.tp_size > 1:
@@ -121,23 +114,6 @@ class ParallelLMHead(VocabParallelEmbedding):
         )
 
     @torch.no_grad()
-    def quantize_weight_int8(self, eps: float = 1e-8):
-        weight = self.weight.data
-        # Store lm_head weights in row-major [N, K] for torch._int_mm.
-        weight_row = weight.t().contiguous()
-        max_abs = weight_row.abs().amax(dim=1)
-        scales = torch.clamp(max_abs / 127.0, min=eps)
-        qweight = torch.round(weight_row / scales[:, None]).clamp(-127, 127).to(torch.int8)
-        self.qweight = qweight
-        self.scales = scales.to(weight.dtype)
-        self.scales_fp16 = scales.to(torch.float16)
-        self.use_int8 = True
-        self.use_int8_marlin = False
-        if "weight" in self._parameters:
-            del self._parameters["weight"]
-        self.register_parameter("weight", None)
-
-    @torch.no_grad()
     def quantize_weight_marlin_int8(self):
         marlin = get_marlin_impl_or_raise()
         weight = self.weight.data
@@ -152,10 +128,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         q_packed, s_packed = marlin["repack_weights"](q_u8, scales, 8)
         self.qweight = q_packed.contiguous()
         self.scales = s_packed.to(weight.dtype if weight.dtype in (torch.float16, torch.bfloat16) else torch.float16).contiguous()
-        self.scales_fp16 = None
         self.workspace = marlin["marlin_make_workspace_new"](weight.device, 4)
         self.use_int8 = True
-        self.use_int8_marlin = True
         if "weight" in self._parameters:
             del self._parameters["weight"]
         self.register_parameter("weight", None)

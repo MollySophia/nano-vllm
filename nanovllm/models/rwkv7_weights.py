@@ -141,14 +141,10 @@ def apply_rwkv7_post_load_quantization(causal_lm):
         causal_lm.lm_head.weight.data.copy_(
             causal_lm.model.z["head.weight"].narrow(0, start_idx, shard_size).t().contiguous()
         )
-    if getattr(causal_lm.config, "rwkv_quant_int8", False) and (
-        getattr(causal_lm.config, "rwkv_quant_int8_lm_head", False)
-        or getattr(causal_lm.config, "rwkv_quant_int8_lm_head_marlin", False)
+    if getattr(causal_lm.config, "rwkv_quant_int8", False) and getattr(
+        causal_lm.config, "rwkv_quant_int8_lm_head", False
     ):
-        if getattr(causal_lm.config, "rwkv_quant_int8_lm_head_marlin", False):
-            causal_lm.lm_head.quantize_weight_marlin_int8()
-        else:
-            causal_lm.lm_head.quantize_weight_int8()
+        causal_lm.lm_head.quantize_weight_marlin_int8()
     if "head.weight" in causal_lm.model.z:
         del causal_lm.model.z["head.weight"]
 

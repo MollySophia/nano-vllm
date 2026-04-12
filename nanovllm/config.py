@@ -16,8 +16,6 @@ class Config:
     rwkv_prefill_max_batch_size: int = 128
     rwkv_quant_int8: bool = False
     rwkv_int8_fp16_lm_head: bool = False
-    rwkv_quant_int8_lm_head: bool = False
-    rwkv_quant_int8_lm_head_marlin: bool = False
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
@@ -35,8 +33,6 @@ class Config:
         ) = normalize_rwkv_int8_lm_head_flags(
             rwkv_quant_int8=self.rwkv_quant_int8,
             rwkv_int8_fp16_lm_head=self.rwkv_int8_fp16_lm_head,
-            rwkv_int8_lm_head=self.rwkv_quant_int8_lm_head,
-            rwkv_int8_lm_head_marlin=self.rwkv_quant_int8_lm_head_marlin,
         )
         model_pth = resolve_model_pth(self.model)
         self.model_config = RWKV7Config.from_pth(model_pth)

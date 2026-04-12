@@ -9,7 +9,6 @@ from nanovllm import LLM, SamplingParams
 from nanovllm.utils.rwkv_int8 import (
     add_rwkv_int8_cli_args,
     describe_rwkv_int8_mode,
-    normalize_rwkv_int8_lm_head_flags,
     resolve_rwkv_int8_lm_head_flags,
 )
 from nanovllm.utils.context import reset_context
@@ -37,19 +36,15 @@ def run_benchmark(
     rwkv_prefill_max_batch_size: int,
     rwkv_quant_int8: bool,
     rwkv_int8_fp16_lm_head: bool = False,
-    rwkv_quant_int8_lm_head: bool = False,
-    rwkv_quant_int8_lm_head_marlin: bool = False,
     enforce_eager: bool = False,
     seed: int = 0,
 ) -> tuple[int, int, int, int, float, float, float, float | None]:
     (
         rwkv_quant_int8_lm_head,
         rwkv_quant_int8_lm_head_marlin,
-    ) = normalize_rwkv_int8_lm_head_flags(
+    ) = resolve_rwkv_int8_lm_head_flags(
         rwkv_quant_int8=rwkv_quant_int8,
         rwkv_int8_fp16_lm_head=rwkv_int8_fp16_lm_head,
-        rwkv_int8_lm_head=rwkv_quant_int8_lm_head,
-        rwkv_int8_lm_head_marlin=rwkv_quant_int8_lm_head_marlin,
     )
     model_dir = ensure_model_dir(model_pth)
     # Prefill consumes the first sampled token, so request one extra token to leave
@@ -68,8 +63,6 @@ def run_benchmark(
         rwkv_prefill_max_batch_size=rwkv_prefill_max_batch_size,
         rwkv_quant_int8=rwkv_quant_int8,
         rwkv_int8_fp16_lm_head=rwkv_int8_fp16_lm_head,
-        rwkv_quant_int8_lm_head=rwkv_quant_int8_lm_head,
-        rwkv_quant_int8_lm_head_marlin=rwkv_quant_int8_lm_head_marlin,
     )
     vocab_size = int(llm.model_runner.config.model_config.vocab_size)
     generator = torch.Generator(device="cpu")
@@ -157,8 +150,6 @@ def main():
     ) = resolve_rwkv_int8_lm_head_flags(
         rwkv_quant_int8=args.rwkv_quant_int8,
         rwkv_int8_fp16_lm_head=args.rwkv_int8_fp16_lm_head,
-        rwkv_int8_lm_head=args.rwkv_int8_lm_head,
-        rwkv_int8_lm_head_marlin=args.rwkv_int8_lm_head_marlin,
     )
     mode_name = describe_rwkv_int8_mode(
         rwkv_quant_int8=args.rwkv_quant_int8,
@@ -187,8 +178,6 @@ def main():
             args.rwkv_prefill_max_batch_size,
             args.rwkv_quant_int8,
             args.rwkv_int8_fp16_lm_head,
-            rwkv_quant_int8_lm_head,
-            rwkv_quant_int8_lm_head_marlin,
             args.enforce_eager,
             args.seed,
         )
@@ -197,8 +186,7 @@ def main():
             f"rwkv_prefill_token_budget={args.rwkv_prefill_token_budget},"
             f"rwkv_prefill_max_batch_size={args.rwkv_prefill_max_batch_size},"
             f"rwkv_quant_int8={int(args.rwkv_quant_int8)},"
-            f"rwkv_quant_int8_lm_head={int(rwkv_quant_int8_lm_head)},"
-            f"rwkv_quant_int8_lm_head_marlin={int(rwkv_quant_int8_lm_head_marlin)},"
+            f"rwkv_int8_fp16_lm_head={int(args.rwkv_int8_fp16_lm_head)},"
             f"rwkv_mode={mode_name},"
             f"prompt_length={args.prompt_length},seed={args.seed},"
             f"n={actual_n},resident_blocks={resident_blocks},"

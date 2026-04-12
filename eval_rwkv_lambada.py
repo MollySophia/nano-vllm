@@ -162,8 +162,6 @@ def main():
         ) = resolve_rwkv_int8_lm_head_flags(
             rwkv_quant_int8=args.rwkv_quant_int8,
             rwkv_int8_fp16_lm_head=args.rwkv_int8_fp16_lm_head,
-            rwkv_int8_lm_head=args.rwkv_int8_lm_head,
-            rwkv_int8_lm_head_marlin=args.rwkv_int8_lm_head_marlin,
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
@@ -188,8 +186,6 @@ def main():
         rwkv_prefill_max_batch_size=args.rwkv_prefill_max_batch_size,
         rwkv_quant_int8=args.rwkv_quant_int8,
         rwkv_int8_fp16_lm_head=args.rwkv_int8_fp16_lm_head,
-        rwkv_quant_int8_lm_head=rwkv_quant_int8_lm_head,
-        rwkv_quant_int8_lm_head_marlin=rwkv_quant_int8_lm_head_marlin,
     )
     runner = llm.model_runner
 
