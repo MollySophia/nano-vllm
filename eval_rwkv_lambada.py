@@ -12,6 +12,11 @@ ROOT = os.path.dirname(__file__)
 
 from nanovllm import LLM, SamplingParams  # noqa: E402
 from nanovllm.tokenizers import RWKVTokenizer, get_rwkv_tokenizer
+from nanovllm.utils.rwkv_int8 import (  # noqa: E402
+    add_rwkv_int8_cli_args,
+    describe_rwkv_int8_mode,
+    resolve_rwkv_int8_lm_head_flags,
+)
 
 
 DEFAULT_LAMBADA = os.path.join(ROOT, "Albatross-better", "eval", "lambada_test.jsonl")
@@ -141,9 +146,7 @@ def main():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.97)
     parser.add_argument("--rwkv-prefill-token-budget", type=int, default=2048)
     parser.add_argument("--rwkv-prefill-max-batch-size", type=int, default=128)
-    parser.add_argument("--rwkv-quant-int8", action="store_true")
-    parser.add_argument("--rwkv-int8-lm-head", action="store_true")
-    parser.add_argument("--rwkv-int8-lm-head-marlin", action="store_true")
+    add_rwkv_int8_cli_args(parser)
     parser.add_argument("--print-interval", type=int, default=1000)
     parser.add_argument(
         "--mode",
@@ -152,8 +155,23 @@ def main():
         help="prefill_then_decode matches the original Lambada-style scoring; decode_only is an optional decode-heavy teacher-forcing mode.",
     )
     args = parser.parse_args()
-    if args.rwkv_int8_lm_head and args.rwkv_int8_lm_head_marlin:
-        raise SystemExit("lm_head cannot be standard int8 and Marlin int8 at the same time")
+    try:
+        (
+            rwkv_quant_int8_lm_head,
+            rwkv_quant_int8_lm_head_marlin,
+        ) = resolve_rwkv_int8_lm_head_flags(
+            rwkv_quant_int8=args.rwkv_quant_int8,
+            rwkv_int8_fp16_lm_head=args.rwkv_int8_fp16_lm_head,
+            rwkv_int8_lm_head=args.rwkv_int8_lm_head,
+            rwkv_int8_lm_head_marlin=args.rwkv_int8_lm_head_marlin,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    rwkv_mode = describe_rwkv_int8_mode(
+        rwkv_quant_int8=args.rwkv_quant_int8,
+        rwkv_quant_int8_lm_head=rwkv_quant_int8_lm_head,
+        rwkv_quant_int8_lm_head_marlin=rwkv_quant_int8_lm_head_marlin,
+    )
 
     tokenizer = get_rwkv_tokenizer()
     samples = load_lambada(tokenizer, args.lambada_path, args.limit, args.pad_eod)
@@ -169,8 +187,9 @@ def main():
         rwkv_prefill_token_budget=args.rwkv_prefill_token_budget,
         rwkv_prefill_max_batch_size=args.rwkv_prefill_max_batch_size,
         rwkv_quant_int8=args.rwkv_quant_int8,
-        rwkv_quant_int8_lm_head=args.rwkv_int8_lm_head or args.rwkv_int8_lm_head_marlin,
-        rwkv_quant_int8_lm_head_marlin=args.rwkv_int8_lm_head_marlin,
+        rwkv_int8_fp16_lm_head=args.rwkv_int8_fp16_lm_head,
+        rwkv_quant_int8_lm_head=rwkv_quant_int8_lm_head,
+        rwkv_quant_int8_lm_head_marlin=rwkv_quant_int8_lm_head_marlin,
     )
     runner = llm.model_runner
 
@@ -208,7 +227,7 @@ def main():
     print(
         f"final_examples={total_examples},ppl={ppl:.4f},acc={acc:.2f},"
         f"target_tokens={total_target_tokens},time_s={dt:.4f},target_tps={target_tps:.2f},"
-        f"rwkv_quant_int8={int(args.rwkv_quant_int8)},mode={args.mode}"
+        f"rwkv_quant_int8={int(args.rwkv_quant_int8)},rwkv_mode={rwkv_mode},mode={args.mode}"
     )
     llm.exit()
 

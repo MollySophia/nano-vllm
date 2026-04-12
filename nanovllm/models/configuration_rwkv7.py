@@ -1,13 +1,12 @@
 # modified from flash-linear-attention
-import torch
 import re
 from pathlib import Path
-from transformers.configuration_utils import PretrainedConfig
+
+import torch
 
 
-class RWKV7Config(PretrainedConfig):
-
-    model_type = 'rwkv7'
+class RWKV7Config:
+    model_type = "rwkv7"
 
     def __init__(
         self,
@@ -74,46 +73,41 @@ class RWKV7Config(PretrainedConfig):
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
 
-        super().__init__(
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            max_position_embeddings=max_position_embeddings,
-            torch_dtype=torch_dtype,
-            **kwargs,
-        )
-
-        # Ensure torch_dtype is set correctly (transformers may rename it to dtype)
+        self.pad_token_id = pad_token_id
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.tie_word_embeddings = tie_word_embeddings
         self.torch_dtype = torch_dtype
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
     @classmethod
     def from_pth(cls, pth_path: str, ctx_len: int | None = None):
         """Create config from RWKV pth file."""
-        z = torch.load(pth_path, map_location='cpu')
+        z = torch.load(pth_path, map_location="cpu")
         if ctx_len is None:
             # Prefer context length encoded in filename like "...-ctx8192.pth".
-            m = re.search(r'ctx(\d+)', Path(pth_path).name.lower())
+            m = re.search(r"ctx(\d+)", Path(pth_path).name.lower())
             ctx_len = int(m.group(1)) if m else 4096
 
         # Infer dimensions from weight keys
         # blocks.0.att.r_k shape: [num_heads, head_dim]
-        n_head, head_size = z['blocks.0.att.r_k'].shape
+        n_head, head_size = z["blocks.0.att.r_k"].shape
         n_embd = n_head * head_size
 
         # Count layers
         max_layer = -1
         for k in z.keys():
-            kk = k.split('.')
-            if kk[0] == 'blocks':
+            kk = k.split(".")
+            if kk[0] == "blocks":
                 max_layer = max(max_layer, int(kk[1]))
         n_layer = max_layer + 1
 
         # Get vocab size from embedding
-        vocab_size = z['emb.weight'].shape[0]
+        vocab_size = z["emb.weight"].shape[0]
 
         # Infer intermediate size from ffn key weight
-        intermediate_size = z['blocks.0.ffn.key.weight'].shape[0]
+        intermediate_size = z["blocks.0.ffn.key.weight"].shape[0]
 
         return cls(
             hidden_size=n_embd,

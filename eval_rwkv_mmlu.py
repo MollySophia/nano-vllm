@@ -13,6 +13,11 @@ ROOT = os.path.dirname(__file__)
 
 from nanovllm import LLM, SamplingParams  # noqa: E402
 from nanovllm.tokenizers import get_rwkv_tokenizer  # noqa: E402
+from nanovllm.utils.rwkv_int8 import (  # noqa: E402
+    add_rwkv_int8_cli_args,
+    describe_rwkv_int8_mode,
+    resolve_rwkv_int8_lm_head_flags,
+)
 
 try:
     from datasets import load_from_disk
@@ -193,14 +198,27 @@ def main():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.97)
     parser.add_argument("--rwkv-prefill-token-budget", type=int, default=2048)
     parser.add_argument("--rwkv-prefill-max-batch-size", type=int, default=128)
-    parser.add_argument("--rwkv-quant-int8", action="store_true")
-    parser.add_argument("--rwkv-int8-lm-head", action="store_true")
-    parser.add_argument("--rwkv-int8-lm-head-marlin", action="store_true")
+    add_rwkv_int8_cli_args(parser)
     parser.add_argument("--print-interval", type=int, default=512)
     parser.add_argument("--predictions-path", default=None)
     args = parser.parse_args()
-    if args.rwkv_int8_lm_head and args.rwkv_int8_lm_head_marlin:
-        raise SystemExit("lm_head cannot be standard int8 and Marlin int8 at the same time")
+    try:
+        (
+            rwkv_quant_int8_lm_head,
+            rwkv_quant_int8_lm_head_marlin,
+        ) = resolve_rwkv_int8_lm_head_flags(
+            rwkv_quant_int8=args.rwkv_quant_int8,
+            rwkv_int8_fp16_lm_head=args.rwkv_int8_fp16_lm_head,
+            rwkv_int8_lm_head=args.rwkv_int8_lm_head,
+            rwkv_int8_lm_head_marlin=args.rwkv_int8_lm_head_marlin,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    rwkv_mode = describe_rwkv_int8_mode(
+        rwkv_quant_int8=args.rwkv_quant_int8,
+        rwkv_quant_int8_lm_head=rwkv_quant_int8_lm_head,
+        rwkv_quant_int8_lm_head_marlin=rwkv_quant_int8_lm_head_marlin,
+    )
 
     tokenizer = get_rwkv_tokenizer()
     subjects = set(args.subject) if args.subject else None
@@ -242,8 +260,9 @@ def main():
         rwkv_prefill_token_budget=args.rwkv_prefill_token_budget,
         rwkv_prefill_max_batch_size=args.rwkv_prefill_max_batch_size,
         rwkv_quant_int8=args.rwkv_quant_int8,
-        rwkv_quant_int8_lm_head=args.rwkv_int8_lm_head or args.rwkv_int8_lm_head_marlin,
-        rwkv_quant_int8_lm_head_marlin=args.rwkv_int8_lm_head_marlin,
+        rwkv_int8_fp16_lm_head=args.rwkv_int8_fp16_lm_head,
+        rwkv_quant_int8_lm_head=rwkv_quant_int8_lm_head,
+        rwkv_quant_int8_lm_head_marlin=rwkv_quant_int8_lm_head_marlin,
     )
     runner = llm.model_runner
 
@@ -279,7 +298,8 @@ def main():
         f"final_examples={total_examples},acc={acc:.2f},"
         f"prompt_tokens={total_prompt_tokens},time_s={dt:.4f},"
         f"prompt_tps={prompt_tps:.2f},examples_per_s={examples_per_s:.2f},"
-        f"rwkv_quant_int8={int(args.rwkv_quant_int8)},shuffle_choices={int(args.shuffle_choices)}"
+        f"rwkv_quant_int8={int(args.rwkv_quant_int8)},rwkv_mode={rwkv_mode},"
+        f"shuffle_choices={int(args.shuffle_choices)}"
     )
     llm.exit()
 

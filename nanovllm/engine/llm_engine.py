@@ -1,9 +1,9 @@
 import atexit
 from dataclasses import fields
 from time import perf_counter
-from tqdm.auto import tqdm
-from transformers import AutoTokenizer
+
 import torch.multiprocessing as mp
+from tqdm.auto import tqdm
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
@@ -30,12 +30,8 @@ class LLMEngine:
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
-        if config.use_state_cache:
-            self.tokenizer = get_rwkv_tokenizer()
-            config.eos = self.tokenizer.eos_token_id
-        else:
-            self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-            config.eos = self.tokenizer.eos_token_id
+        self.tokenizer = get_rwkv_tokenizer()
+        config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 
