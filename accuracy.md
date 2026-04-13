@@ -24,13 +24,13 @@ Relative comparison only. These scores were not tuned for prompt, sampling, stop
 ## LAMBADA
 
 - Dataset: `nanovllm/eval_data/lambada_test.jsonl`, `5153` examples
-- Metric: exact last-word teacher-forcing
+- Metric: exact last-word teacher-forcing, `pad_eod=1`
 
 | backend | mode | ppl | acc | target_tps |
 | --- | --- | ---: | ---: | ---: |
-| `nano-vllm fp16` | `bs1` | `4.6876` | `67.34` | `77.24` |
+| `nano-vllm fp16` | `bs1` | `4.6240` | `67.07` | `77.09` |
 | `Albatross fp16` | `bs1` | `4.6225` | `67.09` | `159.71` |
-| `nano-vllm fp16` | `bs16` | `4.6876` | `67.34` | `84.19` |
+| `nano-vllm fp16` | `bs16` | `4.6241` | `67.07` | `84.06` |
 | `Albatross fp16` | `bs16` | `4.6217` | `67.11` | `486.28` |
 
 ## MMLU

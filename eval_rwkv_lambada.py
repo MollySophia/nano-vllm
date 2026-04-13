@@ -145,7 +145,18 @@ def main():
     parser.add_argument("--lambada-path", default=DEFAULT_LAMBADA)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--pad-eod", action="store_true")
+    parser.add_argument(
+        "--pad-eod",
+        dest="pad_eod",
+        action="store_true",
+        help="Prepend token 0 to each prefix, matching the original Albatross Lambada setup. Default: enabled.",
+    )
+    parser.add_argument(
+        "--no-pad-eod",
+        dest="pad_eod",
+        action="store_false",
+        help="Disable the leading token-0 prefix padding.",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.97)
     parser.add_argument("--max-state-slots", type=int, default=-1)
     parser.add_argument("--rwkv-prefill-token-budget", type=int, default=2048)
@@ -171,7 +182,7 @@ def main():
         default="prefill_then_decode",
         help="prefill_then_decode matches the original Lambada-style scoring; decode_only is an optional decode-heavy teacher-forcing mode.",
     )
-    parser.set_defaults(enforce_eager=True)
+    parser.set_defaults(enforce_eager=True, pad_eod=True)
     args = parser.parse_args()
     try:
         (
@@ -244,7 +255,8 @@ def main():
         f"final_examples={total_examples},ppl={ppl:.4f},acc={acc:.2f},"
         f"target_tokens={total_target_tokens},time_s={dt:.4f},target_tps={target_tps:.2f},"
         f"batch_size={args.batch_size},enforce_eager={int(args.enforce_eager)},"
-        f"rwkv_quant_int8={int(args.rwkv_quant_int8)},rwkv_mode={rwkv_mode},mode={args.mode}"
+        f"rwkv_quant_int8={int(args.rwkv_quant_int8)},rwkv_mode={rwkv_mode},"
+        f"mode={args.mode},pad_eod={int(args.pad_eod)}"
     )
     llm.exit()
 
