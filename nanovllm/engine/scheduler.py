@@ -170,9 +170,11 @@ class Scheduler:
             seq.num_cached_tokens = 0
             seq.exact_cache_hit = False
             seq.state_slot_materialized = False
+            seq.active_state_slot = None
             self.waiting.appendleft(seq)
             return
         self.block_manager.deallocate(seq)
+        seq.active_state_slot = None
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
@@ -191,6 +193,8 @@ class Scheduler:
                     seq.exact_cache_hit = False
                     seq.final_cache_published = False
                     seq.state_slot_materialized = False
+                    seq.active_state_slot = None
                 else:
                     self.block_manager.deallocate(seq)
+                    seq.active_state_slot = None
                 self.running.remove(seq)

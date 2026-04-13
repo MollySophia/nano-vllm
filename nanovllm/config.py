@@ -26,6 +26,8 @@ class Config:
     model_config: RWKV7Config | None = None
     eos: int = -1
     num_state_blocks: int = -1
+    num_state_slots_total: int = -1
+    bs1_graph_slot: int = -1
 
     def __post_init__(self):
         assert os.path.isdir(self.model) or os.path.isfile(self.model)

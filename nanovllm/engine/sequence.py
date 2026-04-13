@@ -32,6 +32,7 @@ class Sequence:
         self.exact_cache_hit = False
         self.final_cache_published = False
         self.state_slot_materialized = False
+        self.active_state_slot: int | None = None
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p
@@ -83,6 +84,7 @@ class Sequence:
                 self.exact_cache_hit,
                 self.final_cache_published,
                 self.state_slot_materialized,
+                self.active_state_slot,
                 self.temperature,
                 self.top_k,
                 self.top_p,
@@ -108,6 +110,7 @@ class Sequence:
             self.exact_cache_hit,
             self.final_cache_published,
             self.state_slot_materialized,
+            self.active_state_slot,
             self.temperature,
             self.top_k,
             self.top_p,

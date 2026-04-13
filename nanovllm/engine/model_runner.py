@@ -170,7 +170,7 @@ class ModelRunner:
             prompt_len=config.rwkv_prefill_token_budget,
         )
 
-        def compute_num_state_blocks():
+        def compute_total_state_slots():
             free, total = torch.cuda.mem_get_info()
             reserve = total * (1 - config.gpu_memory_utilization)
             available = free - reserve - prefill_probe_bytes
@@ -179,22 +179,29 @@ class ModelRunner:
                 num_blocks = min(num_blocks, config.max_state_slots)
             return num_blocks
 
-        config.num_state_blocks = compute_num_state_blocks()
-        if config.num_state_blocks <= 0:
+        total_slots = compute_total_state_slots()
+        if total_slots <= 0:
             gc.collect()
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
-            config.num_state_blocks = compute_num_state_blocks()
-        if config.num_state_blocks <= 0:
+            total_slots = compute_total_state_slots()
+        if total_slots <= 0:
             raise RuntimeError(
-                f"Unable to allocate RWKV state cache: computed num_state_blocks={config.num_state_blocks}. "
+                f"Unable to allocate RWKV state cache: computed total_slots={total_slots}. "
                 "Try lowering model memory pressure or increasing gpu_memory_utilization."
             )
-        self.state_cache = torch.zeros(model_config.num_hidden_layers, config.num_state_blocks, num_heads, head_dim, head_dim)
-        self.token_shift_cache = torch.zeros(2, model_config.num_hidden_layers, config.num_state_blocks, model_config.hidden_size)
+        config.num_state_slots_total = total_slots
+        if self.world_size == 1 and total_slots > 1 and not config.enforce_eager:
+            config.bs1_graph_slot = total_slots - 1
+            config.num_state_blocks = total_slots - 1
+        else:
+            config.bs1_graph_slot = -1
+            config.num_state_blocks = total_slots
+        self.state_cache = torch.zeros(model_config.num_hidden_layers, config.num_state_slots_total, num_heads, head_dim, head_dim)
+        self.token_shift_cache = torch.zeros(2, model_config.num_hidden_layers, config.num_state_slots_total, model_config.hidden_size)
         if config.rwkv_state_cache_enable:
-            self.slot_last_hidden = torch.zeros(config.num_state_blocks, model_config.hidden_size)
-            self.slot_last_hidden_valid = torch.zeros(config.num_state_blocks, dtype=torch.bool)
+            self.slot_last_hidden = torch.zeros(config.num_state_slots_total, model_config.hidden_size)
+            self.slot_last_hidden_valid = torch.zeros(config.num_state_slots_total, dtype=torch.bool)
         else:
             for attr in ("slot_last_hidden", "slot_last_hidden_valid"):
                 if hasattr(self, attr):
@@ -327,11 +334,21 @@ class ModelRunner:
             self.slot_last_hidden_valid.index_fill_(0, slot_ids, False)
 
     def _seq_slot_for_decode(self, seq: Sequence) -> int:
+        if seq.active_state_slot is not None:
+            return int(seq.active_state_slot)
         if self.config.rwkv_state_cache_enable:
             assert seq.state_slot is not None
             return int(seq.state_slot)
         assert seq.block_table
         return int(seq.block_table[0])
+
+    def _shared_bs1_graph_slot(self) -> int | None:
+        if self.config.enforce_eager:
+            return None
+        slot = getattr(self.config, "bs1_graph_slot", -1)
+        if self.world_size != 1 or slot is None or int(slot) < 0:
+            return None
+        return int(slot)
 
     def prepare_prefill(self, seqs: list[Sequence]):
         self._reset_state_cache_slots_for_prefill(seqs)
@@ -428,6 +445,23 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode_single(self, seq: Sequence):
+        graph_slot = self._shared_bs1_graph_slot()
+        if graph_slot is not None and seq.active_state_slot is None:
+            if self.config.rwkv_state_cache_enable and not seq.state_slot_materialized:
+                assert seq.prompt_cache_slot is not None
+                source_slot = int(seq.prompt_cache_slot)
+            else:
+                source_slot = self._seq_slot_for_decode(seq)
+            return self._prepare_decode_single_slots(
+                last_token=seq.last_token,
+                position=len(seq) - 1,
+                context_len=len(seq),
+                slot_in=source_slot,
+                slot_out=graph_slot,
+                temperature=seq.temperature,
+                copy_input_state=(source_slot != graph_slot),
+                prepare_graph=True,
+            )
         input_ids, positions = self.prepare_decode([seq])
         temperatures = self.prepare_sample([seq]) if self.rank == 0 else None
         self._ensure_bs1_decode_graph(input_ids, positions, temperatures is None)
@@ -593,7 +627,10 @@ class ModelRunner:
     def _finalize_finished_sequence_cache(self, seq: Sequence, token_id: int) -> None:
         if seq.state_slot is None:
             return
-        if seq.state_slot_materialized:
+        if seq.active_state_slot is not None:
+            slot_in = int(seq.active_state_slot)
+            slot_out = int(seq.state_slot)
+        elif seq.state_slot_materialized:
             slot_in = int(seq.state_slot)
             slot_out = int(seq.state_slot)
         else:
@@ -613,7 +650,23 @@ class ModelRunner:
         )
         seq.final_cache_published = True
 
+    def _after_bs1_decode_step(self, seq: Sequence) -> None:
+        graph_slot = self._shared_bs1_graph_slot()
+        if graph_slot is not None and seq.active_state_slot is None:
+            seq.active_state_slot = graph_slot
+        if not self.config.rwkv_state_cache_enable or seq.state_slot_materialized:
+            return
+        if self.rank == 0 and self.state_slot_manager is not None and seq.prompt_cache_slot is not None:
+            self.state_slot_manager.unpin_cached(seq.prompt_cache_slot)
+        if seq.state_slot is not None:
+            self._invalidate_bs1_slot_graphs(int(seq.state_slot))
+            if seq.active_state_slot is None:
+                seq.active_state_slot = int(seq.state_slot)
+        seq.state_slot_materialized = True
+
     def _ensure_bs1_decode_graph(self, input_ids: torch.Tensor, positions: torch.Tensor, greedy_only: bool):
+        if self.config.enforce_eager:
+            return
         if self.world_size != 1:
             return
         cached = self._bs1_decode_tensors
@@ -846,26 +899,18 @@ class ModelRunner:
                 self._finalize_finished_sequence_cache(seq, token_id)
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        if self.config.rwkv_state_cache_enable and not is_prefill and len(seqs) == 1:
-            seq = seqs[0]
-            if seq.state_slot_materialized:
-                input_ids, positions, temperatures = self.prepare_decode_single(seq)
-                token = self.decode_single_step(seq, input_ids, positions, temperatures, record_sequence=False)
-                token_ids = [int(token.item())] if self.rank == 0 else None
-            else:
-                logits = self._compute_decode_logits_with_state_cache([seq])
-                token_ids = self.sampler(logits, [seq]).tolist() if self.rank == 0 else None
-            self.prepare_postprocess(seqs, token_ids)
-            reset_context()
-            return token_ids
-        if not self.config.rwkv_state_cache_enable and not is_prefill and len(seqs) == 1:
+        if not is_prefill and len(seqs) == 1:
             seq = seqs[0]
             input_ids, positions, temperatures = self.prepare_decode_single(seq)
             token = self.decode_single_step(seq, input_ids, positions, temperatures, record_sequence=False)
+            self._after_bs1_decode_step(seq)
             reset_context()
             if self.rank == 0:
-                return [int(token.item())]
-            return None
+                token_ids = [int(token.item())]
+            else:
+                token_ids = None
+            self.prepare_postprocess(seqs, token_ids)
+            return token_ids
         logits = self.run_logits(seqs, is_prefill)
         token_ids = self.sampler(logits, seqs).tolist() if self.rank == 0 else None
         self.prepare_postprocess(seqs, token_ids)

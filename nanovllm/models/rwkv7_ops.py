@@ -120,7 +120,8 @@ def _rwkv7_tmix_one_impl(
     v = F.linear(xv, value_weight)
     a = torch.sigmoid(F.linear(F.linear(xa, a1), a2, bias=a0))
     g = F.linear(torch.sigmoid(F.linear(xg, g1)), g2)
-    kk = F.normalize((k * k_k).view(-1, num_heads, head_dim), dim=-1, p=2.0).view_as(k)
+    # Match the Albatross single-token path exactly to minimize fp16 tie flips.
+    kk = F.normalize((k * k_k).view(num_heads, head_dim), dim=-1, p=2.0).view_as(k)
     k = k * (1 + (a - 1) * k_a)
     kka = kk * a
 
@@ -147,9 +148,15 @@ def _rwkv7_tmix_one_post_impl(
     ln_x_weight: torch.Tensor,
     ln_x_bias: torch.Tensor,
 ):
-    y = F.group_norm(wkv_out.view_as(r), num_groups=num_heads, weight=ln_x_weight, bias=ln_x_bias, eps=64e-5)
+    y = F.group_norm(
+        wkv_out.view(1, num_heads * head_dim),
+        num_groups=num_heads,
+        weight=ln_x_weight,
+        bias=ln_x_bias,
+        eps=64e-5,
+    ).view(num_heads * head_dim)
     y = y + (
-        ((r * k * r_k).view(-1, num_heads, head_dim).sum(dim=-1, keepdim=True) * v.view(-1, num_heads, head_dim)).view_as(r)
+        ((r * k * r_k).view(num_heads, head_dim).sum(dim=-1, keepdim=True) * v.view(num_heads, head_dim)).view(num_heads * head_dim)
     )
     return F.linear(y * g, output_weight)
 
@@ -422,40 +429,29 @@ def _rwkv7_decode_block_one_contiguous(
         if att_tokenshift_cache_out.data_ptr() != att_tokenshift_cache_in.data_ptr():
             att_tokenshift_cache_out[0].copy_(att_tokenshift_cache_in[0])
         x_prev = att_tokenshift_cache_out[0]
-        r, w, k, v, a, kk, kka, g, v_first, xx = _rwkv7_tmix_one(
-            layer_idx,
-            num_heads,
-            head_dim,
-            h,
-            x_prev,
-            v_first,
-            x_r,
-            x_w,
-            x_k,
-            x_v,
-            x_a,
-            x_g,
-            w0,
-            w1_proj.weight,
-            w2_proj.weight,
-            a0,
-            a1_proj.weight,
-            a2_proj.weight,
-            v0,
-            v1_proj.weight,
-            v2_proj.weight,
-            g1_proj.weight,
-            g2_proj.weight,
-            k_k,
-            k_a,
-            r_k,
-            receptance_proj.weight,
-            key_proj.weight,
-            value_proj.weight,
-            output_proj.weight,
-            ln_x_weight,
-            ln_x_bias,
-        )
+        xx = x_prev - h
+        x_prev.copy_(h)
+        xr = torch.addcmul(h, xx, x_r)
+        xw = torch.addcmul(h, xx, x_w)
+        xk = torch.addcmul(h, xx, x_k)
+        xv = torch.addcmul(h, xx, x_v)
+        xa = torch.addcmul(h, xx, x_a)
+        xg = torch.addcmul(h, xx, x_g)
+
+        r = F.linear(xr, receptance_proj.weight)
+        w = F.linear(torch.tanh(F.linear(xw, w1_proj.weight)), w2_proj.weight, bias=w0)
+        k = F.linear(xk, key_proj.weight)
+        v = F.linear(xv, value_proj.weight)
+        a = torch.sigmoid(F.linear(F.linear(xa, a1_proj.weight), a2_proj.weight, bias=a0))
+        g = F.linear(torch.sigmoid(F.linear(xg, g1_proj.weight)), g2_proj.weight)
+        kk = F.normalize((k * k_k).view(num_heads, head_dim), dim=-1, p=2.0).view_as(k)
+        k = k * (1 + (a - 1) * k_a)
+        kka = kk * a
+        if layer_idx == 0:
+            v_first = v
+        else:
+            assert v_first is not None
+            v = v + (v_first - v) * torch.sigmoid(F.linear(F.linear(xv, v1_proj.weight), v2_proj.weight, bias=v0))
     else:
         x0 = x[0]
         h = F.layer_norm(x0, (x0.shape[-1],), ln1_gamma, ln1_beta, ln1_eps)
@@ -496,19 +492,17 @@ def _rwkv7_decode_block_one_contiguous(
         positions[0:1],
     )
     if use_fp16_tmix_helper and isinstance(output_proj, MatmulLinear):
-        y = _rwkv7_tmix_one_post(
-            num_heads,
-            head_dim,
-            y.view(1, -1),
-            r.view(1, -1),
-            k.view(1, -1),
-            v.view(1, -1),
-            g.view(1, -1),
-            r_k,
-            output_proj.weight,
-            ln_x_weight,
-            ln_x_bias,
-        ).view(-1)
+        y = F.group_norm(
+            y.view(1, num_heads * head_dim),
+            num_groups=num_heads,
+            weight=ln_x_weight,
+            bias=ln_x_bias,
+            eps=64e-5,
+        ).view(num_heads * head_dim)
+        y = y + (
+            ((r * k * r_k).view(num_heads, head_dim).sum(dim=-1, keepdim=True) * v.view(num_heads, head_dim)).view(num_heads * head_dim)
+        )
+        y = F.linear(y * g, output_proj.weight)
     else:
         y = F.group_norm(y.view(1, -1), num_groups=num_heads, weight=ln_x_weight, bias=ln_x_bias, eps=64e-5).view(-1)
         y = y + ((r * k * r_k).view(1, num_heads, head_dim).sum(dim=-1, keepdim=True) * v.view(1, num_heads, head_dim)).view_as(r)

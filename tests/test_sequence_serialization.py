@@ -27,6 +27,7 @@ class SequenceSerializationTest(unittest.TestCase):
         seq.exact_cache_hit = True
         seq.final_cache_published = True
         seq.state_slot_materialized = True
+        seq.active_state_slot = 6
         seq.penalty_state = {42: 1.25}
         seq.allow_sparse_penalty_state = True
 
@@ -51,6 +52,7 @@ class SequenceSerializationTest(unittest.TestCase):
         self.assertTrue(clone.exact_cache_hit)
         self.assertTrue(clone.final_cache_published)
         self.assertTrue(clone.state_slot_materialized)
+        self.assertEqual(clone.active_state_slot, 6)
         self.assertEqual(clone.penalty_state, {42: 1.25})
         self.assertTrue(clone.allow_sparse_penalty_state)
 
@@ -71,6 +73,7 @@ class SequenceSerializationTest(unittest.TestCase):
         seq.append_token(23)
         seq.state_slot = 7
         seq.cached_prefix_len = 1
+        seq.active_state_slot = 9
         seq.penalty_state = {23: 0.5}
 
         clone = pickle.loads(pickle.dumps(seq))
@@ -85,6 +88,7 @@ class SequenceSerializationTest(unittest.TestCase):
         self.assertFalse(clone.ignore_eos)
         self.assertEqual(clone.state_slot, 7)
         self.assertEqual(clone.cached_prefix_len, 1)
+        self.assertEqual(clone.active_state_slot, 9)
         self.assertEqual(clone.penalty_state, {23: 0.5})
 
 
