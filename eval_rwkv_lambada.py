@@ -152,6 +152,18 @@ def main():
     parser.add_argument("--rwkv-prefill-max-batch-size", type=int, default=128)
     parser.add_argument("--rwkv-state-cache-enable", action="store_true")
     add_rwkv_int8_cli_args(parser)
+    parser.add_argument(
+        "--enforce-eager",
+        dest="enforce_eager",
+        action="store_true",
+        help="Disable CUDA graph capture in the underlying LLM. Default: enabled.",
+    )
+    parser.add_argument(
+        "--no-enforce-eager",
+        dest="enforce_eager",
+        action="store_false",
+        help="Allow CUDA graph capture in the underlying LLM when available.",
+    )
     parser.add_argument("--print-interval", type=int, default=1000)
     parser.add_argument(
         "--mode",
@@ -159,6 +171,7 @@ def main():
         default="prefill_then_decode",
         help="prefill_then_decode matches the original Lambada-style scoring; decode_only is an optional decode-heavy teacher-forcing mode.",
     )
+    parser.set_defaults(enforce_eager=True)
     args = parser.parse_args()
     try:
         (
@@ -181,7 +194,7 @@ def main():
     model_dir = ensure_model_dir(args.model_pth)
     llm = LLM(
         model_dir,
-        enforce_eager=True,
+        enforce_eager=args.enforce_eager,
         tensor_parallel_size=1,
         max_num_seqs=max(args.batch_size, 8),
         max_num_batched_tokens=max(16384, args.batch_size * 32),
@@ -230,6 +243,7 @@ def main():
     print(
         f"final_examples={total_examples},ppl={ppl:.4f},acc={acc:.2f},"
         f"target_tokens={total_target_tokens},time_s={dt:.4f},target_tps={target_tps:.2f},"
+        f"batch_size={args.batch_size},enforce_eager={int(args.enforce_eager)},"
         f"rwkv_quant_int8={int(args.rwkv_quant_int8)},rwkv_mode={rwkv_mode},mode={args.mode}"
     )
     llm.exit()

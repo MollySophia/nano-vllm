@@ -201,8 +201,21 @@ def main():
     parser.add_argument("--rwkv-prefill-max-batch-size", type=int, default=128)
     parser.add_argument("--rwkv-state-cache-enable", action="store_true")
     add_rwkv_int8_cli_args(parser)
+    parser.add_argument(
+        "--enforce-eager",
+        dest="enforce_eager",
+        action="store_true",
+        help="Disable CUDA graph capture in the underlying LLM. Default: enabled.",
+    )
+    parser.add_argument(
+        "--no-enforce-eager",
+        dest="enforce_eager",
+        action="store_false",
+        help="Allow CUDA graph capture in the underlying LLM when available.",
+    )
     parser.add_argument("--print-interval", type=int, default=512)
     parser.add_argument("--predictions-path", default=None)
+    parser.set_defaults(enforce_eager=True)
     args = parser.parse_args()
     try:
         (
@@ -251,7 +264,7 @@ def main():
     model_dir = ensure_model_dir(args.model_pth)
     llm = LLM(
         model_dir,
-        enforce_eager=True,
+        enforce_eager=args.enforce_eager,
         tensor_parallel_size=1,
         max_num_seqs=max(args.batch_size, 8),
         max_num_batched_tokens=max(16384, args.batch_size * max_prompt_tokens),
@@ -298,6 +311,7 @@ def main():
         f"final_examples={total_examples},acc={acc:.2f},"
         f"prompt_tokens={total_prompt_tokens},time_s={dt:.4f},"
         f"prompt_tps={prompt_tps:.2f},examples_per_s={examples_per_s:.2f},"
+        f"batch_size={args.batch_size},enforce_eager={int(args.enforce_eager)},"
         f"rwkv_quant_int8={int(args.rwkv_quant_int8)},rwkv_mode={rwkv_mode},"
         f"shuffle_choices={int(args.shuffle_choices)}"
     )

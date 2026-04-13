@@ -188,6 +188,16 @@ def extract_final_answer(text: str) -> str | None:
     return None
 
 
+def normalize_gold_answer(raw_answer: str) -> str:
+    normalized = normalize_number(raw_answer)
+    if normalized is not None:
+        return normalized
+    extracted = extract_final_answer(raw_answer)
+    if extracted is not None:
+        return extracted
+    return raw_answer.strip()
+
+
 def load_gsm8k(path: str, tokenizer, limit: int, prompt_style: str) -> list[Sample]:
     samples: list[Sample] = []
     with open(path, "r", encoding="utf-8") as f:
@@ -202,7 +212,7 @@ def load_gsm8k(path: str, tokenizer, limit: int, prompt_style: str) -> list[Samp
             samples.append(
                 Sample(
                     problem=row["problem"],
-                    gold_answer=normalize_number(row["answer"]) or row["answer"].strip(),
+                    gold_answer=normalize_gold_answer(row["answer"]),
                     prompt=prompt,
                     prompt_tokens=len(tokenizer.encode(prompt)),
                     expected_context=expected_context,
@@ -210,6 +220,39 @@ def load_gsm8k(path: str, tokenizer, limit: int, prompt_style: str) -> list[Samp
             )
             if limit > 0 and len(samples) >= limit:
                 break
+    return samples
+
+
+def load_gsm8k_hf(split: str, tokenizer, limit: int, prompt_style: str) -> list[Sample]:
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise SystemExit(
+            "datasets is required for --hf-gsm8k. Install it or provide --gsm8k-path."
+        ) from exc
+
+    dataset = load_dataset("gsm8k", "main", split=split)
+    samples: list[Sample] = []
+    for row in dataset:
+        problem = row["question"]
+        answer = row["answer"]
+        if prompt_style == "rwkv_rs_two_stage":
+            expected_context = build_rwkv_rs_expected_context(problem)
+            prompt = get_prompt_for_cot(expected_context)
+        else:
+            expected_context = None
+            prompt = build_legacy_prompt(problem)
+        samples.append(
+            Sample(
+                problem=problem,
+                gold_answer=normalize_gold_answer(answer),
+                prompt=prompt,
+                prompt_tokens=len(tokenizer.encode(prompt)),
+                expected_context=expected_context,
+            )
+        )
+        if limit > 0 and len(samples) >= limit:
+            break
     return samples
 
 
@@ -292,6 +335,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-pth", required=True)
     parser.add_argument("--gsm8k-path", default=DEFAULT_GSM8K)
+    parser.add_argument(
+        "--hf-gsm8k",
+        action="store_true",
+        help="Load the official gsm8k dataset via datasets instead of a local jsonl file.",
+    )
+    parser.add_argument(
+        "--hf-split",
+        default="test",
+        help="datasets split to use with --hf-gsm8k. Default: test",
+    )
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument(
@@ -312,9 +365,22 @@ def main():
     add_rwkv_int8_cli_args(parser)
     parser.add_argument("--max-num-seqs", type=int, default=32)
     parser.add_argument("--max-num-batched-tokens", type=int, default=32768)
+    parser.add_argument(
+        "--enforce-eager",
+        dest="enforce_eager",
+        action="store_true",
+        help="Disable CUDA graph capture in the underlying LLM. Default: enabled.",
+    )
+    parser.add_argument(
+        "--no-enforce-eager",
+        dest="enforce_eager",
+        action="store_false",
+        help="Allow CUDA graph capture in the underlying LLM when available.",
+    )
     parser.add_argument("--print-interval", type=int, default=10)
     parser.add_argument("--show-samples", type=int, default=3)
     parser.add_argument("--predictions-out")
+    parser.set_defaults(enforce_eager=True)
     args = parser.parse_args()
     try:
         (
@@ -333,14 +399,17 @@ def main():
     )
 
     tokenizer = get_rwkv_tokenizer()
-    samples = load_gsm8k(args.gsm8k_path, tokenizer, args.limit, args.prompt_style)
+    if args.hf_gsm8k:
+        samples = load_gsm8k_hf(args.hf_split, tokenizer, args.limit, args.prompt_style)
+    else:
+        samples = load_gsm8k(args.gsm8k_path, tokenizer, args.limit, args.prompt_style)
     if not samples:
         raise SystemExit("no GSM8K samples loaded")
 
     model_dir = ensure_model_dir(args.model_pth)
     llm = LLM(
         model_dir,
-        enforce_eager=True,
+        enforce_eager=args.enforce_eager,
         tensor_parallel_size=1,
         max_num_seqs=max(args.max_num_seqs, args.batch_size),
         max_num_batched_tokens=max(args.max_num_batched_tokens, args.batch_size * 1024),
@@ -412,8 +481,9 @@ def main():
         f"final_examples={len(samples)},acc={acc:.2f},extract_rate={extract_rate:.2f},"
         f"prompt_tokens={total_prompt_tokens},output_tokens={total_output_tokens},"
         f"time_s={dt:.4f},prompt_tps={prompt_tps:.2f},output_tps={output_tps:.2f},"
+        f"batch_size={args.batch_size},enforce_eager={int(args.enforce_eager)},"
         f"rwkv_quant_int8={int(args.rwkv_quant_int8)},rwkv_mode={rwkv_mode},"
-        f"prompt_style={args.prompt_style}"
+        f"prompt_style={args.prompt_style},hf_gsm8k={int(args.hf_gsm8k)}"
     )
     llm.exit()
 
