@@ -197,6 +197,7 @@ def main():
     parser.add_argument("--subject", action="append", default=None)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.97)
     parser.add_argument("--max-state-slots", type=int, default=-1)
+    parser.add_argument("--rwkv-state-cache-safety-reserve-slots", type=int, default=0)
     parser.add_argument("--rwkv-prefill-token-budget", type=int, default=2048)
     parser.add_argument("--rwkv-prefill-max-batch-size", type=int, default=128)
     parser.add_argument("--rwkv-state-cache-enable", action="store_true")
@@ -271,6 +272,7 @@ def main():
         max_model_len=8192,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_state_slots=args.max_state_slots,
+        rwkv_state_cache_safety_reserve_slots=args.rwkv_state_cache_safety_reserve_slots,
         rwkv_prefill_token_budget=args.rwkv_prefill_token_budget,
         rwkv_prefill_max_batch_size=args.rwkv_prefill_max_batch_size,
         rwkv_state_cache_enable=args.rwkv_state_cache_enable,

@@ -33,8 +33,10 @@ def run_benchmark(
     decode_steps: int,
     gpu_memory_utilization: float,
     max_state_slots: int,
+    rwkv_state_cache_safety_reserve_slots: int,
     rwkv_prefill_token_budget: int,
     rwkv_prefill_max_batch_size: int,
+    rwkv_prefill_chunk_size: int,
     rwkv_state_cache_enable: bool,
     rwkv_quant_int8: bool,
     rwkv_int8_fp16_lm_head: bool = False,
@@ -62,8 +64,10 @@ def run_benchmark(
         max_model_len=8192,
         gpu_memory_utilization=gpu_memory_utilization,
         max_state_slots=max_state_slots,
+        rwkv_state_cache_safety_reserve_slots=rwkv_state_cache_safety_reserve_slots,
         rwkv_prefill_token_budget=rwkv_prefill_token_budget,
         rwkv_prefill_max_batch_size=rwkv_prefill_max_batch_size,
+        rwkv_prefill_chunk_size=rwkv_prefill_chunk_size,
         rwkv_state_cache_enable=rwkv_state_cache_enable,
         rwkv_quant_int8=rwkv_quant_int8,
         rwkv_int8_fp16_lm_head=rwkv_int8_fp16_lm_head,
@@ -81,7 +85,7 @@ def run_benchmark(
     torch.cuda.synchronize()
     prefill_t0 = time.perf_counter()
     prefill_tokens = 0
-    while llm.scheduler.waiting:
+    while llm.scheduler.waiting or any(seq.num_prefill_tokens_remaining > 0 for seq in llm.scheduler.running):
         outputs, num_tokens = llm.step()
         assert len(outputs) == 0
         if num_tokens > 0:
@@ -143,8 +147,10 @@ def main():
     parser.add_argument("--decode-steps", type=int, default=128)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.95)
     parser.add_argument("--max-state-slots", type=int, default=-1)
+    parser.add_argument("--rwkv-state-cache-safety-reserve-slots", type=int, default=0)
     parser.add_argument("--rwkv-prefill-token-budget", type=int, default=2048)
     parser.add_argument("--rwkv-prefill-max-batch-size", type=int, default=128)
+    parser.add_argument("--rwkv-prefill-chunk-size", type=int, default=-1)
     parser.add_argument("--rwkv-state-cache-enable", action="store_true")
     add_rwkv_int8_cli_args(parser)
     parser.add_argument("--enforce-eager", action="store_true")
@@ -181,8 +187,10 @@ def main():
             args.decode_steps,
             args.gpu_memory_utilization,
             args.max_state_slots,
+            args.rwkv_state_cache_safety_reserve_slots,
             args.rwkv_prefill_token_budget,
             args.rwkv_prefill_max_batch_size,
+            args.rwkv_prefill_chunk_size,
             args.rwkv_state_cache_enable,
             args.rwkv_quant_int8,
             args.rwkv_int8_fp16_lm_head,
@@ -192,8 +200,10 @@ def main():
         summary = (
             f"gpu_memory_utilization={args.gpu_memory_utilization:.2f},"
             f"max_state_slots={args.max_state_slots},"
+            f"rwkv_state_cache_safety_reserve_slots={args.rwkv_state_cache_safety_reserve_slots},"
             f"rwkv_prefill_token_budget={args.rwkv_prefill_token_budget},"
             f"rwkv_prefill_max_batch_size={args.rwkv_prefill_max_batch_size},"
+            f"rwkv_prefill_chunk_size={args.rwkv_prefill_chunk_size},"
             f"rwkv_state_cache_enable={int(args.rwkv_state_cache_enable)},"
             f"rwkv_quant_int8={int(args.rwkv_quant_int8)},"
             f"rwkv_int8_fp16_lm_head={int(args.rwkv_int8_fp16_lm_head)},"

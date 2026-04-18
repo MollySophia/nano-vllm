@@ -63,6 +63,45 @@ class Sampler(nn.Module):
         if logits.size(0) == 0:
             return torch.empty((0,), dtype=torch.int64, device=logits.device)
 
+        uniform_sampling_config = self._uniform_sampling_config(seqs)
+        if uniform_sampling_config is not None:
+            mode, temperature, top_k, top_p, presence_penalty, repetition_penalty, penalty_decay = uniform_sampling_config
+            if mode == "greedy":
+                return logits.argmax(dim=-1)
+            if presence_penalty == 0.0 and repetition_penalty == 0.0:
+                return self._sample_without_penalties(
+                    logits,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                )
+            if slot_penalties is not None:
+                if slot_ids is None:
+                    raise ValueError("slot_ids are required when slot_penalties are provided.")
+                return self._sample_with_dense_slot_penalties(
+                    logits,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    presence_penalty=presence_penalty,
+                    repetition_penalty=repetition_penalty,
+                    penalty_decay=penalty_decay,
+                    slot_penalties=slot_penalties,
+                    slot_ids=slot_ids,
+                    indices=list(range(len(seqs))),
+                )
+            if all(getattr(seq, "allow_sparse_penalty_state", False) for seq in seqs):
+                return self._sample_with_sequence_penalties(
+                    logits,
+                    seqs,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    presence_penalty=presence_penalty,
+                    repetition_penalty=repetition_penalty,
+                    penalty_decay=penalty_decay,
+                )
+
         outputs = torch.empty(logits.size(0), dtype=torch.int64, device=logits.device)
         for sampling_config, indices in self._group_indices_by_sampling(seqs):
             index_tensor = torch.tensor(indices, dtype=torch.int64, device=logits.device)
@@ -172,41 +211,25 @@ class Sampler(nn.Module):
         indices: list[int],
     ) -> torch.Tensor:
         slot_index = self._resolve_slot_index_tensor(slot_ids, indices, logits.device)
-        local_penalties = slot_penalties.index_select(0, slot_index.to(slot_penalties.device))
-        if self._can_use_rapid_sampling(
+        local_occurrences = slot_penalties.index_select(0, slot_index.to(slot_penalties.device))
+        penalized_logits = self._apply_dense_occurrence_penalties(
             logits,
-            ("sample", temperature, top_k, top_p, presence_penalty, repetition_penalty, penalty_decay),
-        ):
-            rapid_logits = logits.float().contiguous()
-            local_penalties = local_penalties.to(device=rapid_logits.device, dtype=torch.float32)
-            rand_states = self._ensure_rand_states(rapid_logits.size(0), rapid_logits.device)
-            sampled = rapid_sampling.batch_sampling_repetition_temperature_topk_topp(
-                rapid_logits,
-                local_penalties,
-                rand_states,
-                presence_penalty,
-                repetition_penalty,
-                penalty_decay,
-                temperature,
-                top_k,
-                top_p,
-            )
-        else:
-            penalized_logits = logits.float() - local_penalties.to(device=logits.device, dtype=torch.float32)
-            sampled = self._sample_top_k_top_p(
-                penalized_logits,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-            )
-            self._update_dense_penalties(
-                local_penalties,
-                sampled,
-                presence_penalty=presence_penalty,
-                repetition_penalty=repetition_penalty,
-                penalty_decay=penalty_decay,
-            )
-        slot_penalties.index_copy_(0, slot_index.to(slot_penalties.device), local_penalties.to(slot_penalties.device))
+            local_occurrences.to(device=logits.device, dtype=torch.float32),
+            presence_penalty=presence_penalty,
+            repetition_penalty=repetition_penalty,
+        )
+        sampled = self._sample_top_k_top_p(
+            penalized_logits,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+        )
+        self._update_dense_occurrences(
+            local_occurrences,
+            sampled,
+            penalty_decay=penalty_decay,
+        )
+        slot_penalties.index_copy_(0, slot_index.to(slot_penalties.device), local_occurrences.to(slot_penalties.device))
         return sampled
 
     def _sample_with_sequence_penalties(
@@ -224,8 +247,12 @@ class Sampler(nn.Module):
         outputs = torch.empty(logits.size(0), dtype=torch.int64, device=logits.device)
         for row, seq in enumerate(seqs):
             adjusted_logits = logits[row].float().clone()
-            for token_id, penalty in seq.penalty_state.items():
-                adjusted_logits[token_id] -= penalty
+            self._apply_sparse_occurrence_penalties_(
+                adjusted_logits,
+                seq.penalty_state,
+                presence_penalty=presence_penalty,
+                repetition_penalty=repetition_penalty,
+            )
             token = self._sample_top_k_top_p(
                 adjusted_logits.unsqueeze(0),
                 temperature=temperature,
@@ -233,11 +260,9 @@ class Sampler(nn.Module):
                 top_p=top_p,
             )[0]
             outputs[row] = token
-            self._update_sparse_penalties(
+            self._update_sparse_occurrences(
                 seq.penalty_state,
                 int(token.item()),
-                presence_penalty=presence_penalty,
-                repetition_penalty=repetition_penalty,
                 penalty_decay=penalty_decay,
             )
         return outputs
@@ -254,40 +279,60 @@ class Sampler(nn.Module):
             slot_ids_tensor = torch.tensor(list(slot_ids), dtype=torch.int64, device=device)
         return slot_ids_tensor.index_select(0, torch.tensor(indices, dtype=torch.int64, device=device))
 
-    def _update_dense_penalties(
+    def _apply_dense_occurrence_penalties(
         self,
-        penalties: torch.Tensor,
+        logits: torch.Tensor,
+        occurrences: torch.Tensor,
+        *,
+        presence_penalty: float,
+        repetition_penalty: float,
+    ) -> torch.Tensor:
+        adjusted = logits.float().clone()
+        seen = occurrences > 0
+        if presence_penalty != 0.0:
+            adjusted = adjusted - seen.to(dtype=adjusted.dtype) * presence_penalty
+        if repetition_penalty != 0.0:
+            adjusted = adjusted - occurrences.to(dtype=adjusted.dtype) * repetition_penalty
+        return adjusted
+
+    def _apply_sparse_occurrence_penalties_(
+        self,
+        logits: torch.Tensor,
+        occurrence_state: dict[int, float],
+        *,
+        presence_penalty: float,
+        repetition_penalty: float,
+    ) -> None:
+        for token_id, occurrence in occurrence_state.items():
+            penalty = presence_penalty + occurrence * repetition_penalty
+            logits[token_id] -= penalty
+
+    def _update_dense_occurrences(
+        self,
+        occurrences: torch.Tensor,
         token_ids: torch.Tensor,
         *,
-        presence_penalty: float,
-        repetition_penalty: float,
         penalty_decay: float,
     ) -> None:
-        token_ids = token_ids.to(device=penalties.device, dtype=torch.int64)
-        existing = penalties.gather(1, token_ids.unsqueeze(1))
-        penalties.mul_(penalty_decay)
-        additions = torch.where(
-            existing == 0,
-            torch.full_like(existing, presence_penalty),
-            torch.full_like(existing, repetition_penalty),
-        )
-        penalties.scatter_add_(1, token_ids.unsqueeze(1), additions)
+        seen = occurrences > 0
+        occurrences.mul_(penalty_decay)
+        if seen.any():
+            floor = torch.finfo(occurrences.dtype).tiny
+            occurrences.masked_fill_(seen & (occurrences < floor), floor)
+        token_ids = token_ids.to(device=occurrences.device, dtype=torch.int64)
+        ones = torch.ones((token_ids.numel(), 1), dtype=occurrences.dtype, device=occurrences.device)
+        occurrences.scatter_add_(1, token_ids.unsqueeze(1), ones)
 
-    def _update_sparse_penalties(
+    def _update_sparse_occurrences(
         self,
-        penalty_state: dict[int, float],
+        occurrence_state: dict[int, float],
         token_id: int,
         *,
-        presence_penalty: float,
-        repetition_penalty: float,
         penalty_decay: float,
     ) -> None:
-        for key in list(penalty_state.keys()):
-            penalty_state[key] *= penalty_decay
-            if abs(penalty_state[key]) < 1e-8:
-                penalty_state.pop(key)
-        existing = penalty_state.get(token_id, 0.0)
-        penalty_state[token_id] = existing + (presence_penalty if existing == 0.0 else repetition_penalty)
+        for key in list(occurrence_state.keys()):
+            occurrence_state[key] *= penalty_decay
+        occurrence_state[token_id] = occurrence_state.get(token_id, 0.0) + 1.0
 
     def _sample_top_k_top_p(
         self,
@@ -329,6 +374,15 @@ class Sampler(nn.Module):
             groups.setdefault(sampling_config, []).append(idx)
         return list(groups.items())
 
+    def _uniform_sampling_config(self, seqs: list) -> tuple | None:
+        if not seqs:
+            return None
+        first = self._sampling_config_for_seq(seqs[0])
+        for seq in seqs[1:]:
+            if self._sampling_config_for_seq(seq) != first:
+                return None
+        return first
+
     def _sampling_config_for_seq(self, seq) -> tuple:
         uses_penalties = seq.presence_penalty != 0.0 or seq.repetition_penalty != 0.0
         if seq.temperature <= GREEDY_TEMPERATURE_EPS and not uses_penalties:
@@ -361,7 +415,9 @@ class Sampler(nn.Module):
         return top_k, top_p
 
     def _can_use_rapid_sampling(self, group_logits: torch.Tensor, sampling_config: tuple) -> bool:
-        _, temperature, _, _, _, _, _ = sampling_config
+        _, temperature, _, _, presence_penalty, repetition_penalty, _ = sampling_config
+        if presence_penalty != 0.0 or repetition_penalty != 0.0:
+            return False
         if not group_logits.is_cuda:
             return False
         if group_logits.dim() != 2:

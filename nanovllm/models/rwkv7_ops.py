@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Optional
 
 import torch
@@ -24,6 +25,10 @@ _NEXP_HALF = _NEXP_HALF_LOG2_E * _LN2
 _NLOG2E_LN2 = _NLOG2_E * _LN2
 _TWO_TO_NEG_41 = 4.547473508864641e-13
 _RO1_I32 = -1640531527
+_MAX_NONCONTIGUOUS_STATE_GATHER_ROWS = max(
+    1,
+    int(os.getenv("NANOVLLM_MAX_NONCONTIGUOUS_STATE_GATHER_ROWS", "4")),
+)
 
 
 def _maybe_compile_rwkv_helper(fn):
@@ -626,6 +631,14 @@ def _is_contiguous_in_order(slots: torch.Tensor) -> bool:
     return torch.equal(slots, expected)
 
 
+def _state_rows_for_sorted_run(state_cache: torch.Tensor, sorted_slots: torch.Tensor, start: int, end: int) -> torch.Tensor:
+    run_slots = sorted_slots[start:end]
+    if _is_contiguous_in_order(run_slots):
+        slot_start = int(run_slots[0].item())
+        return state_cache[slot_start:slot_start + (end - start)]
+    return state_cache[run_slots].contiguous()
+
+
 def _wkv7_one_batch_inplace_by_slot_runs(
     state_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -747,7 +760,6 @@ def _wkv7_one_batch_out_by_slot_runs(
         return y
 
     slot_in_sorted = slot_mapping_in[order]
-    state_in_sorted = state_cache[slot_in_sorted].contiguous()
     r_sorted = r[order]
     w_sorted = w[order]
     k_sorted = k[order]
@@ -758,17 +770,37 @@ def _wkv7_one_batch_out_by_slot_runs(
     y_sorted = torch.empty_like(r_sorted)
 
     for start, end, slot_start, slot_end in runs:
-        y_sorted[start:end] = wkv7_one_batch_cuda(
-            state_in_sorted[start:end],
-            state_cache[slot_start:slot_end],
-            r_sorted[start:end],
-            w_sorted[start:end],
-            k_sorted[start:end],
-            v_sorted[start:end],
-            kk_sorted[start:end],
-            kka_sorted[start:end],
-            positions_sorted[start:end],
-        )
+        run_slots_in = slot_in_sorted[start:end]
+        if _is_contiguous_in_order(run_slots_in):
+            y_sorted[start:end] = wkv7_one_batch_cuda(
+                _state_rows_for_sorted_run(state_cache, slot_in_sorted, start, end),
+                state_cache[slot_start:slot_end],
+                r_sorted[start:end],
+                w_sorted[start:end],
+                k_sorted[start:end],
+                v_sorted[start:end],
+                kk_sorted[start:end],
+                kka_sorted[start:end],
+                positions_sorted[start:end],
+            )
+            continue
+        chunk_start = start
+        while chunk_start < end:
+            chunk_end = min(chunk_start + _MAX_NONCONTIGUOUS_STATE_GATHER_ROWS, end)
+            out_slot_start = slot_start + (chunk_start - start)
+            out_slot_end = out_slot_start + (chunk_end - chunk_start)
+            y_sorted[chunk_start:chunk_end] = wkv7_one_batch_cuda(
+                _state_rows_for_sorted_run(state_cache, slot_in_sorted, chunk_start, chunk_end),
+                state_cache[out_slot_start:out_slot_end],
+                r_sorted[chunk_start:chunk_end],
+                w_sorted[chunk_start:chunk_end],
+                k_sorted[chunk_start:chunk_end],
+                v_sorted[chunk_start:chunk_end],
+                kk_sorted[chunk_start:chunk_end],
+                kka_sorted[chunk_start:chunk_end],
+                positions_sorted[chunk_start:chunk_end],
+            )
+            chunk_start = chunk_end
 
     return y_sorted[inverse]
 
@@ -868,7 +900,6 @@ def _wkv7_seq_batch_out_by_slot_runs(
         return y
 
     slot_in_sorted = slot_mapping_in[order]
-    state_in_sorted = state_cache[slot_in_sorted].contiguous()
     r_sorted = r[order]
     w_sorted = w[order]
     k_sorted = k[order]
@@ -879,16 +910,36 @@ def _wkv7_seq_batch_out_by_slot_runs(
     y_sorted = torch.empty_like(r_sorted)
 
     for start, end, slot_start, slot_end in runs:
-        y_sorted[start:end] = wkv7_seq_batch_cuda(
-            state_in_sorted[start:end],
-            state_cache[slot_start:slot_end],
-            r_sorted[start:end],
-            w_sorted[start:end],
-            k_sorted[start:end],
-            v_sorted[start:end],
-            kk_sorted[start:end],
-            kka_sorted[start:end],
-            elapsed_sorted[start:end],
-        )
+        run_slots_in = slot_in_sorted[start:end]
+        if _is_contiguous_in_order(run_slots_in):
+            y_sorted[start:end] = wkv7_seq_batch_cuda(
+                _state_rows_for_sorted_run(state_cache, slot_in_sorted, start, end),
+                state_cache[slot_start:slot_end],
+                r_sorted[start:end],
+                w_sorted[start:end],
+                k_sorted[start:end],
+                v_sorted[start:end],
+                kk_sorted[start:end],
+                kka_sorted[start:end],
+                elapsed_sorted[start:end],
+            )
+            continue
+        chunk_start = start
+        while chunk_start < end:
+            chunk_end = min(chunk_start + _MAX_NONCONTIGUOUS_STATE_GATHER_ROWS, end)
+            out_slot_start = slot_start + (chunk_start - start)
+            out_slot_end = out_slot_start + (chunk_end - chunk_start)
+            y_sorted[chunk_start:chunk_end] = wkv7_seq_batch_cuda(
+                _state_rows_for_sorted_run(state_cache, slot_in_sorted, chunk_start, chunk_end),
+                state_cache[out_slot_start:out_slot_end],
+                r_sorted[chunk_start:chunk_end],
+                w_sorted[chunk_start:chunk_end],
+                k_sorted[chunk_start:chunk_end],
+                v_sorted[chunk_start:chunk_end],
+                kk_sorted[chunk_start:chunk_end],
+                kka_sorted[chunk_start:chunk_end],
+                elapsed_sorted[chunk_start:chunk_end],
+            )
+            chunk_start = chunk_end
 
     return y_sorted[inverse]

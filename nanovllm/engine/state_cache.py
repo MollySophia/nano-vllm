@@ -43,15 +43,22 @@ class _TrieNode:
 
 class StatePrefixIndex:
 
-    def __init__(self):
+    def __init__(self, cache_key_token_rewriter=None):
         self.root = _TrieNode(children={})
         self.slot_to_key: dict[int, tuple[int, ...]] = {}
+        self.cache_key_token_rewriter = cache_key_token_rewriter
+
+    def _rewrite_cache_key(self, token_ids: list[int] | tuple[int, ...]) -> list[int]:
+        if self.cache_key_token_rewriter is None:
+            return [int(token_id) for token_id in token_ids]
+        return [int(token_id) for token_id in self.cache_key_token_rewriter(token_ids)]
 
     def lookup(self, token_ids: list[int]) -> PrefixCacheHit | None:
+        rewritten_token_ids = self._rewrite_cache_key(token_ids)
         node = self.root
         best_slot_id = None
         best_prefix_len = 0
-        for prefix_len, token_id in enumerate(token_ids, start=1):
+        for prefix_len, token_id in enumerate(rewritten_token_ids, start=1):
             node = node.children.get(token_id)
             if node is None:
                 break
@@ -65,11 +72,11 @@ class StatePrefixIndex:
             slot_id=best_slot_id,
             prefix_len=best_prefix_len,
             cache_key=cache_key,
-            exact=best_prefix_len == len(token_ids),
+            exact=best_prefix_len == len(rewritten_token_ids),
         )
 
     def insert(self, token_ids: list[int], prefix_len: int, slot_id: int) -> tuple[int, ...]:
-        cache_key = tuple(token_ids[:prefix_len])
+        cache_key = tuple(self._rewrite_cache_key(token_ids[:prefix_len]))
         old_key = self.slot_to_key.get(slot_id)
         if old_key is not None and old_key != cache_key:
             self.remove_slot(slot_id)

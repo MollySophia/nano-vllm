@@ -2,29 +2,31 @@ import unittest
 from types import SimpleNamespace
 
 from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.state_cache import StatePrefixIndex, StateSlotManager
 from nanovllm.sampling_params import SamplingParams
 
 
-def _config(num_state_blocks: int = 8):
+def _config(num_state_blocks: int = 8, stop_token_seqs=()):
     return SimpleNamespace(
         max_num_seqs=16,
         max_num_batched_tokens=4096,
         rwkv_prefill_max_batch_size=16,
         rwkv_prefill_token_budget=4096,
+        rwkv_prefill_chunk_size=-1,
         eos=0,
+        stop_token_seqs=stop_token_seqs,
         rwkv_state_cache_enable=True,
         num_state_blocks=num_state_blocks,
     )
 
 
-def _seq(token_ids: list[int], max_tokens: int = 4) -> Sequence:
+def _seq(token_ids: list[int], max_tokens: int = 4, ignore_eos: bool = True) -> Sequence:
     return Sequence(
         token_ids,
         SamplingParams(
             temperature=0.0,
-            ignore_eos=True,
+            ignore_eos=ignore_eos,
             max_tokens=max_tokens,
         ),
     )
@@ -71,6 +73,27 @@ class RWKVStateCacheTest(unittest.TestCase):
         self.assertEqual(slots.slot_meta[a.slot_id].state.name, "CACHED_PINNED")
         self.assertEqual(slots.slot_meta[b.slot_id].state.name, "LIVE")
 
+    def test_prefix_index_insert_canonicalizes_rwkv_mobile_cache_key_suffixes(self):
+        from nanovllm.tokenizers import RWKVTokenizer
+
+        index = StatePrefixIndex(cache_key_token_rewriter=RWKVTokenizer.canonicalize_state_cache_token_ids)
+
+        cache_key = index.insert([7, 10080, 261, 8], 4, 0)
+
+        self.assertEqual(cache_key, (7, 28329, 11, 8))
+
+        canonical_hit = index.lookup([7, 28329, 11, 8, 9])
+        self.assertIsNotNone(canonical_hit)
+        assert canonical_hit is not None
+        self.assertEqual(canonical_hit.slot_id, 0)
+        self.assertEqual(canonical_hit.prefix_len, 4)
+
+        raw_hit = index.lookup([7, 10080, 261, 8, 9])
+        self.assertIsNotNone(raw_hit)
+        assert raw_hit is not None
+        self.assertEqual(raw_hit.slot_id, 0)
+        self.assertEqual(raw_hit.prefix_len, 4)
+
     def test_scheduler_exact_hit_reuses_cached_prompt_slot_and_allocates_new_live_slot(self):
         scheduler = Scheduler(_config())
         source = scheduler.slot_manager.allocate_writable_slot(requires_zero_init=True)
@@ -109,6 +132,46 @@ class RWKVStateCacheTest(unittest.TestCase):
         self.assertNotEqual(scheduled.prompt_cache_slot, source.slot_id)
         self.assertNotEqual(scheduled.state_slot, source.slot_id)
         self.assertNotEqual(scheduled.state_slot, scheduled.prompt_cache_slot)
+
+    def test_hidden_eos_requires_finalize_decode_before_finish(self):
+        scheduler = Scheduler(_config())
+        seq = _seq([1, 2, 3], max_tokens=4, ignore_eos=False)
+        scheduler.add(seq)
+
+        seqs, is_prefill = scheduler.schedule()
+        self.assertTrue(is_prefill)
+
+        scheduler.postprocess(seqs, [0])
+        self.assertFalse(seq.is_finished)
+        self.assertTrue(seq.pending_hidden_finalize)
+        self.assertEqual(seq.raw_completion_token_ids, [0])
+        self.assertEqual(seq.completion_token_ids, [])
+
+        seq.num_cached_tokens = seq.num_prompt_tokens
+        decode_seqs, is_prefill = scheduler.schedule()
+        self.assertFalse(is_prefill)
+        self.assertEqual(decode_seqs, [seq])
+
+        scheduler.postprocess(decode_seqs, [None])
+        self.assertTrue(seq.is_finished)
+        self.assertFalse(seq.pending_hidden_finalize)
+
+    def test_decode_schedules_hidden_finalize_before_regular_decode(self):
+        scheduler = Scheduler(_config())
+        finalize_seq = _seq([1, 2, 3], max_tokens=4, ignore_eos=False)
+        regular_seq = _seq([4, 5, 6], max_tokens=4, ignore_eos=False)
+        for slot_id, seq in enumerate((finalize_seq, regular_seq)):
+            seq.num_cached_tokens = seq.num_prompt_tokens
+            seq.state_slot = slot_id
+        finalize_seq.status = regular_seq.status = SequenceStatus.RUNNING
+        finalize_seq.pending_hidden_finalize = True
+        scheduler.running.append(finalize_seq)
+        scheduler.running.append(regular_seq)
+
+        scheduled = scheduler.schedule_decode_only()
+
+        self.assertEqual(scheduled, [finalize_seq])
+        self.assertEqual(list(scheduler.running), [finalize_seq, regular_seq])
 
     def test_scheduler_preempt_releases_live_slots_and_unpins_cache_hit(self):
         scheduler = Scheduler(_config())

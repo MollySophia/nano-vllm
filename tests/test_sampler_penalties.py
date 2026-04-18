@@ -34,11 +34,25 @@ class SamplerPenaltyTests(unittest.TestCase):
 
         first = sampler(logits, [seq], slot_penalties=slot_penalties, slot_ids=[0])
         self.assertEqual(first.tolist(), [0])
-        self.assertTrue(torch.equal(slot_penalties[0], torch.tensor([10.0, 0.0, 0.0, 0.0])))
+        self.assertTrue(torch.equal(slot_penalties[0], torch.tensor([1.0, 0.0, 0.0, 0.0])))
 
         second = sampler(logits, [seq], slot_penalties=slot_penalties, slot_ids=[0])
         self.assertEqual(second.tolist(), [1])
-        self.assertTrue(torch.equal(slot_penalties[0], torch.tensor([5.0, 10.0, 0.0, 0.0])))
+        self.assertTrue(torch.equal(slot_penalties[0], torch.tensor([0.5, 1.0, 0.0, 0.0])))
+
+    def test_sparse_occurrence_state_matches_reference_formula(self):
+        sampler = Sampler()
+        seq = self._make_seq()
+        seq.allow_sparse_penalty_state = True
+        logits = torch.tensor([[5.0, 1.0, 0.0, -1.0]], dtype=torch.float32)
+
+        first = sampler(logits, [seq])
+        self.assertEqual(first.tolist(), [0])
+        self.assertEqual(seq.penalty_state, {0: 1.0})
+
+        second = sampler(logits, [seq])
+        self.assertEqual(second.tolist(), [1])
+        self.assertEqual(seq.penalty_state, {0: 0.5, 1: 1.0})
 
     def test_penalties_require_slot_state(self):
         sampler = Sampler()

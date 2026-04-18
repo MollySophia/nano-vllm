@@ -14,8 +14,10 @@ class Config:
     max_model_len: int = 4096
     rwkv_prefill_token_budget: int = 2048
     rwkv_prefill_max_batch_size: int = 128
+    rwkv_prefill_chunk_size: int = -1
     rwkv_state_cache_enable: bool = False
     max_state_slots: int = -1
+    rwkv_state_cache_safety_reserve_slots: int = 0
     sampling_bucket_temperature_resolution: float = 0.0
     sampling_bucket_top_p_resolution: float = 0.0
     rwkv_quant_int8: bool = False
@@ -32,8 +34,15 @@ class Config:
     def __post_init__(self):
         assert os.path.isdir(self.model) or os.path.isfile(self.model)
         assert 1 <= self.tensor_parallel_size <= 8
+        assert self.max_num_seqs == -1 or self.max_num_seqs > 0, "max_num_seqs must be -1 or a positive integer."
         assert self.rwkv_prefill_token_budget > 0
+        assert self.rwkv_prefill_chunk_size == -1 or self.rwkv_prefill_chunk_size > 0, (
+            "rwkv_prefill_chunk_size must be -1 or a positive integer."
+        )
         assert self.max_state_slots == -1 or self.max_state_slots > 0, "max_state_slots must be -1 or a positive integer."
+        assert self.rwkv_state_cache_safety_reserve_slots >= 0, (
+            "rwkv_state_cache_safety_reserve_slots must be non-negative."
+        )
         assert self.sampling_bucket_temperature_resolution >= 0.0, "sampling_bucket_temperature_resolution must be non-negative."
         assert self.sampling_bucket_top_p_resolution >= 0.0, "sampling_bucket_top_p_resolution must be non-negative."
         if self.rwkv_state_cache_enable:
@@ -47,10 +56,6 @@ class Config:
         )
         model_pth = resolve_model_pth(self.model)
         self.model_config = RWKV7Config.from_pth(model_pth)
-
-        default_gpu_memory_utilization = type(self).gpu_memory_utilization
-        if self.gpu_memory_utilization == default_gpu_memory_utilization:
-            self.gpu_memory_utilization = 0.97
 
         self.max_model_len = min(self.max_model_len, self.model_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len

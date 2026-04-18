@@ -28,6 +28,7 @@ class SequenceSerializationTest(unittest.TestCase):
         seq.final_cache_published = True
         seq.state_slot_materialized = True
         seq.active_state_slot = 6
+        seq.pending_hidden_finalize = True
         seq.penalty_state = {42: 1.25}
         seq.allow_sparse_penalty_state = True
 
@@ -53,6 +54,7 @@ class SequenceSerializationTest(unittest.TestCase):
         self.assertTrue(clone.final_cache_published)
         self.assertTrue(clone.state_slot_materialized)
         self.assertEqual(clone.active_state_slot, 6)
+        self.assertTrue(clone.pending_hidden_finalize)
         self.assertEqual(clone.penalty_state, {42: 1.25})
         self.assertTrue(clone.allow_sparse_penalty_state)
 
@@ -90,6 +92,28 @@ class SequenceSerializationTest(unittest.TestCase):
         self.assertEqual(clone.cached_prefix_len, 1)
         self.assertEqual(clone.active_state_slot, 9)
         self.assertEqual(clone.penalty_state, {23: 0.5})
+
+    def test_hidden_stop_token_roundtrip_preserves_visible_completion_view(self):
+        seq = Sequence(
+            [31, 32],
+            SamplingParams(
+                temperature=0.0,
+                max_tokens=8,
+            ),
+        )
+        seq.append_token(261)
+        seq.hidden_completion_token_count = 1
+        seq.last_token_hidden_from_output = True
+
+        clone = pickle.loads(pickle.dumps(seq))
+
+        self.assertEqual(clone.token_ids, [31, 32, 261])
+        self.assertEqual(clone.num_raw_completion_tokens, 1)
+        self.assertEqual(clone.num_completion_tokens, 0)
+        self.assertEqual(clone.raw_completion_token_ids, [261])
+        self.assertEqual(clone.completion_token_ids, [])
+        self.assertEqual(clone.hidden_completion_token_count, 1)
+        self.assertTrue(clone.last_token_hidden_from_output)
 
 
 if __name__ == "__main__":

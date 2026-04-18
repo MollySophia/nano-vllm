@@ -1,5 +1,7 @@
 import pickle
 import gc
+import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -11,8 +13,162 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.linear import MarlinInt8Linear
 from nanovllm.models.rwkv7 import RWKV7ForCausalLM
 from nanovllm.layers.sampler import GREEDY_TEMPERATURE_EPS, Sampler
-from nanovllm.utils.context import set_context, reset_context
+from nanovllm.utils.context import get_context, set_context, reset_context
 from nanovllm.utils.loader import load_model
+
+
+def _bs1_requires_sequence_sampler(*, temperature: float, presence_penalty: float, repetition_penalty: float) -> bool:
+    return (
+        temperature > GREEDY_TEMPERATURE_EPS
+        or presence_penalty != 0.0
+        or repetition_penalty != 0.0
+    )
+
+
+class ModelRunProfiler:
+    def __init__(self, label: str = ""):
+        self.label = label or "default"
+        self.started_at = time.perf_counter()
+        self.step_counts = {"decode": 0, "prefill": 0}
+        self.seq_totals = {"decode": 0, "prefill": 0}
+        self.total_s = {"decode": 0.0, "prefill": 0.0}
+        self.prepare_s = {"decode": 0.0, "prefill": 0.0}
+        self.forward_s = {"decode": 0.0, "prefill": 0.0}
+        self.sample_s = {"decode": 0.0, "prefill": 0.0}
+        self.post_s = {"decode": 0.0, "prefill": 0.0}
+        self.prefill_exec_batches = 0
+        self.prefill_logical_tokens = 0
+        self.prefill_flat_padded_tokens = 0
+        self.prefill_bucketed_padded_tokens = 0
+
+    def record_step(
+        self,
+        *,
+        kind: str,
+        seq_count: int,
+        total_s: float,
+        prepare_s: float,
+        forward_s: float,
+        sample_s: float,
+        post_s: float,
+        prefill_exec_batches: int = 0,
+        prefill_logical_tokens: int = 0,
+        prefill_flat_padded_tokens: int = 0,
+        prefill_bucketed_padded_tokens: int = 0,
+    ) -> None:
+        self.step_counts[kind] += 1
+        self.seq_totals[kind] += seq_count
+        self.total_s[kind] += total_s
+        self.prepare_s[kind] += prepare_s
+        self.forward_s[kind] += forward_s
+        self.sample_s[kind] += sample_s
+        self.post_s[kind] += post_s
+        if kind == "prefill":
+            self.prefill_exec_batches += prefill_exec_batches
+            self.prefill_logical_tokens += prefill_logical_tokens
+            self.prefill_flat_padded_tokens += prefill_flat_padded_tokens
+            self.prefill_bucketed_padded_tokens += prefill_bucketed_padded_tokens
+
+    def emit_report(self) -> None:
+        def _avg_ms(total_s: float, count: int) -> float:
+            if count <= 0:
+                return 0.0
+            return total_s * 1000.0 / count
+
+        def _avg_bsz(kind: str) -> float:
+            count = self.step_counts[kind]
+            if count <= 0:
+                return 0.0
+            return self.seq_totals[kind] / count
+
+        wall_s = time.perf_counter() - self.started_at
+        print(
+            f"[model-run-profile] label={self.label} wall_s={wall_s:.3f}",
+            flush=True,
+        )
+        for kind in ("decode", "prefill"):
+            count = self.step_counts[kind]
+            other_s = self.total_s[kind] - self.prepare_s[kind] - self.forward_s[kind] - self.sample_s[kind] - self.post_s[kind]
+            extra = ""
+            if kind == "prefill":
+                flat_amp = self.prefill_flat_padded_tokens / max(1, self.prefill_logical_tokens)
+                bucketed_amp = self.prefill_bucketed_padded_tokens / max(1, self.prefill_logical_tokens)
+                exec_batches_per_step = self.prefill_exec_batches / count if count > 0 else 0.0
+                logical_tokens_per_step = self.prefill_logical_tokens / count if count > 0 else 0.0
+                flat_padded_tokens_per_step = self.prefill_flat_padded_tokens / count if count > 0 else 0.0
+                bucketed_padded_tokens_per_step = self.prefill_bucketed_padded_tokens / count if count > 0 else 0.0
+                extra = (
+                    f" prefill_exec_batches_per_step={exec_batches_per_step:.2f} "
+                    f"prefill_logical_tokens_per_step={logical_tokens_per_step:.2f} "
+                    f"prefill_flat_padded_tokens_per_step={flat_padded_tokens_per_step:.2f} "
+                    f"prefill_bucketed_padded_tokens_per_step={bucketed_padded_tokens_per_step:.2f} "
+                    f"prefill_flat_padding_amp={flat_amp:.3f} "
+                    f"prefill_bucketed_padding_amp={bucketed_amp:.3f}"
+                )
+            print(
+                "[model-run-profile] "
+                f"{kind}_steps count={count} avg_bsz={_avg_bsz(kind):.2f} "
+                f"total_ms_per_step={_avg_ms(self.total_s[kind], count):.3f} "
+                f"prepare_ms_per_step={_avg_ms(self.prepare_s[kind], count):.3f} "
+                f"forward_ms_per_step={_avg_ms(self.forward_s[kind], count):.3f} "
+                f"sample_ms_per_step={_avg_ms(self.sample_s[kind], count):.3f} "
+                f"post_ms_per_step={_avg_ms(self.post_s[kind], count):.3f} "
+                f"other_ms_per_step={_avg_ms(other_s, count):.3f}"
+                f"{extra}",
+                flush=True,
+            )
+
+
+def _build_prefill_bucket_plan(step_lengths: list[int]) -> tuple[list[list[int]], int, int, int]:
+    if not step_lengths:
+        return [], 0, 0, 0
+    buckets_by_length: dict[int, list[int]] = {}
+    for index, step_tokens in enumerate(step_lengths):
+        if step_tokens <= 0:
+            continue
+        buckets_by_length.setdefault(step_tokens, []).append(index)
+    buckets = [buckets_by_length[length] for length in sorted(buckets_by_length, reverse=True)]
+    positive_lengths = [step_tokens for step_tokens in step_lengths if step_tokens > 0]
+    logical_tokens = sum(step_lengths)
+    flat_padded_tokens = (max(positive_lengths) * len(positive_lengths)) if positive_lengths else 0
+    bucketed_padded_tokens = sum(len(bucket) * step_lengths[bucket[0]] for bucket in buckets)
+    return buckets, logical_tokens, flat_padded_tokens, bucketed_padded_tokens
+
+
+def _resolve_state_slot_layout(
+    *,
+    total_slots_capacity: int,
+    requested_max_num_seqs: int,
+    rwkv_state_cache_enable: bool,
+    world_size: int,
+    enforce_eager: bool,
+) -> tuple[int, int, int, int]:
+    if total_slots_capacity <= 0:
+        raise ValueError("total_slots_capacity must be positive.")
+
+    total_slots = total_slots_capacity
+    if not rwkv_state_cache_enable and requested_max_num_seqs != -1:
+        target_active_slots = min(requested_max_num_seqs, total_slots_capacity)
+        reserve_graph_slot = (
+            world_size == 1
+            and not enforce_eager
+            and total_slots_capacity > target_active_slots
+        )
+        total_slots = target_active_slots + int(reserve_graph_slot)
+
+    if world_size == 1 and total_slots > 1 and not enforce_eager:
+        bs1_graph_slot = total_slots - 1
+        num_state_blocks = total_slots - 1
+    else:
+        bs1_graph_slot = -1
+        num_state_blocks = total_slots
+
+    if requested_max_num_seqs == -1:
+        effective_max_num_seqs = num_state_blocks
+    else:
+        effective_max_num_seqs = min(requested_max_num_seqs, num_state_blocks)
+
+    return total_slots, num_state_blocks, bs1_graph_slot, effective_max_num_seqs
 
 
 class ModelRunner:
@@ -24,6 +180,14 @@ class ModelRunner:
         self.rank = rank
         self.event = event
         self.eos = config.eos
+        self.stop_token_seqs = tuple(tuple(seq) for seq in getattr(config, "stop_token_seqs", ()) if seq)
+        self._run_profile = self._create_run_profiler()
+        self._run_profile_prepare_s = 0.0
+        self._run_profile_forward_s = 0.0
+        self._run_profile_prefill_exec_batches = 0
+        self._run_profile_prefill_logical_tokens = 0
+        self._run_profile_prefill_flat_padded_tokens = 0
+        self._run_profile_prefill_bucketed_padded_tokens = 0
         self._bs1_decode_tensors = None
         self._bs1_temperature = None
         self._bs1_decode_graphs = {}
@@ -79,6 +243,14 @@ class ModelRunner:
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
 
+    def _create_run_profiler(self) -> ModelRunProfiler | None:
+        if self.rank != 0:
+            return None
+        raw = os.getenv("NANOVLLM_MODEL_RUN_PROFILE", os.getenv("NANOVLLM_BATCHER_PROFILE", ""))
+        if raw.lower() in ("", "0", "false", "off", "no"):
+            return None
+        return ModelRunProfiler(label=os.getenv("NANOVLLM_MODEL_RUN_PROFILE_LABEL", os.getenv("NANOVLLM_BATCHER_PROFILE_LABEL", "")))
+
     def exit(self):
         try:
             if self.world_size > 1 and hasattr(self, "shm"):
@@ -116,6 +288,8 @@ class ModelRunner:
             except Exception:
                 pass
         finally:
+            if self._run_profile is not None:
+                self._run_profile.emit_report()
             if dist.is_available() and dist.is_initialized():
                 try:
                     dist.destroy_process_group()
@@ -177,26 +351,37 @@ class ModelRunner:
             num_blocks = int(available) // block_bytes
             if config.max_state_slots != -1:
                 num_blocks = min(num_blocks, config.max_state_slots)
+            if config.rwkv_state_cache_safety_reserve_slots > 0:
+                num_blocks -= config.rwkv_state_cache_safety_reserve_slots
             return num_blocks
 
-        total_slots = compute_total_state_slots()
-        if total_slots <= 0:
+        total_slots_capacity = compute_total_state_slots()
+        if total_slots_capacity <= 0:
             gc.collect()
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
-            total_slots = compute_total_state_slots()
-        if total_slots <= 0:
+            total_slots_capacity = compute_total_state_slots()
+        if total_slots_capacity <= 0:
             raise RuntimeError(
-                f"Unable to allocate RWKV state cache: computed total_slots={total_slots}. "
+                f"Unable to allocate RWKV state cache: computed total_slots={total_slots_capacity}. "
                 "Try lowering model memory pressure or increasing gpu_memory_utilization."
             )
+        (
+            total_slots,
+            num_state_blocks,
+            bs1_graph_slot,
+            effective_max_num_seqs,
+        ) = _resolve_state_slot_layout(
+            total_slots_capacity=total_slots_capacity,
+            requested_max_num_seqs=config.max_num_seqs,
+            rwkv_state_cache_enable=config.rwkv_state_cache_enable,
+            world_size=self.world_size,
+            enforce_eager=config.enforce_eager,
+        )
         config.num_state_slots_total = total_slots
-        if self.world_size == 1 and total_slots > 1 and not config.enforce_eager:
-            config.bs1_graph_slot = total_slots - 1
-            config.num_state_blocks = total_slots - 1
-        else:
-            config.bs1_graph_slot = -1
-            config.num_state_blocks = total_slots
+        config.num_state_blocks = num_state_blocks
+        config.bs1_graph_slot = bs1_graph_slot
+        config.max_num_seqs = effective_max_num_seqs
         self.state_cache = torch.zeros(model_config.num_hidden_layers, config.num_state_slots_total, num_heads, head_dim, head_dim)
         self.token_shift_cache = torch.zeros(2, model_config.num_hidden_layers, config.num_state_slots_total, model_config.hidden_size)
         if config.rwkv_state_cache_enable:
@@ -306,7 +491,7 @@ class ModelRunner:
             fresh_slots = sorted({
                 int(seq.prompt_cache_slot)
                 for seq in seqs
-                if seq.cached_prefix_len == 0 and seq.prompt_cache_slot is not None
+                if seq.num_cached_tokens == 0 and seq.prompt_cache_slot is not None
             })
         else:
             fresh_slots = sorted({
@@ -350,6 +535,12 @@ class ModelRunner:
             return None
         return int(slot)
 
+    def _prefill_step_tokens(self, seq: Sequence) -> int:
+        return seq.prefill_step_tokens(self.config.rwkv_prefill_chunk_size)
+
+    def _prefill_bucket_plan(self, seqs: list[Sequence]) -> tuple[list[list[int]], int, int, int]:
+        return _build_prefill_bucket_plan([self._prefill_step_tokens(seq) for seq in seqs])
+
     def prepare_prefill(self, seqs: list[Sequence]):
         self._reset_state_cache_slots_for_prefill(seqs)
         input_rows = []
@@ -357,19 +548,22 @@ class ModelRunner:
         slot_mapping_in = []
         slot_mapping_out = []
         context_lens = []
-        if self.config.rwkv_state_cache_enable:
-            max_seqlen = max(seq.num_prompt_tokens - seq.cached_prefix_len for seq in seqs)
-        else:
-            max_seqlen = max(len(seq) - seq.num_cached_tokens for seq in seqs)
+        max_seqlen = max(self._prefill_step_tokens(seq) for seq in seqs)
         for seq in seqs:
+            step_tokens = self._prefill_step_tokens(seq)
             if self.config.rwkv_state_cache_enable:
-                new_token_ids = seq.prompt_token_ids[seq.cached_prefix_len:]
-                start_pos = seq.cached_prefix_len
-                slot_in = seq.cache_hit_slot if seq.cache_hit_slot is not None else seq.prompt_cache_slot
+                chunk_end = seq.num_cached_tokens + step_tokens
+                new_token_ids = seq.prompt_token_ids[seq.num_cached_tokens:chunk_end]
+                start_pos = seq.num_cached_tokens
+                if seq.num_cached_tokens == seq.cached_prefix_len and seq.cache_hit_slot is not None:
+                    slot_in = seq.cache_hit_slot
+                else:
+                    slot_in = seq.prompt_cache_slot
                 slot_out = seq.prompt_cache_slot
             else:
-                new_token_ids = seq[seq.num_cached_tokens:]
-                start_pos = 0
+                chunk_end = seq.num_cached_tokens + step_tokens
+                new_token_ids = seq.prompt_token_ids[seq.num_cached_tokens:chunk_end]
+                start_pos = seq.num_cached_tokens
                 block_id = seq.block_table[0] if seq.block_table else 0
                 slot_in = block_id
                 slot_out = block_id
@@ -446,6 +640,11 @@ class ModelRunner:
 
     def prepare_decode_single(self, seq: Sequence):
         graph_slot = self._shared_bs1_graph_slot()
+        use_sequence_sampler = _bs1_requires_sequence_sampler(
+            temperature=seq.temperature,
+            presence_penalty=seq.presence_penalty,
+            repetition_penalty=seq.repetition_penalty,
+        )
         if graph_slot is not None and seq.active_state_slot is None:
             if self.config.rwkv_state_cache_enable and not seq.state_slot_materialized:
                 assert seq.prompt_cache_slot is not None
@@ -459,6 +658,7 @@ class ModelRunner:
                 slot_in=source_slot,
                 slot_out=graph_slot,
                 temperature=seq.temperature,
+                force_sampler=use_sequence_sampler,
                 copy_input_state=(source_slot != graph_slot),
                 prepare_graph=True,
             )
@@ -475,6 +675,7 @@ class ModelRunner:
         slot_in: int,
         slot_out: int,
         temperature: float = 0.0,
+        force_sampler: bool = False,
         copy_input_state: bool = True,
         prepare_graph: bool = True,
     ):
@@ -505,7 +706,7 @@ class ModelRunner:
             slot_mapping_out=cached["slot_mapping_out"],
         )
         temperatures = None
-        if self.rank == 0 and temperature > GREEDY_TEMPERATURE_EPS:
+        if self.rank == 0 and (force_sampler or temperature > GREEDY_TEMPERATURE_EPS):
             if self._bs1_temperature is None:
                 self._bs1_temperature = torch.empty(1, dtype=torch.float32, device="cuda")
             self._bs1_temperature[0] = temperature
@@ -596,66 +797,43 @@ class ModelRunner:
         cache_key = self.prefix_index.insert(token_ids, prefix_len, slot_id)
         self.state_slot_manager.mark_cached(slot_id, cache_key, prefix_len)
 
-    def _would_finish_after_token(self, seq: Sequence, token_id: int) -> bool:
-        return ((not seq.ignore_eos and token_id == self.eos) or (seq.num_completion_tokens + 1 == seq.max_tokens))
+    def _matches_stop_token_seq_after_token(self, seq: Sequence, token_id: int) -> bool:
+        if not self.stop_token_seqs:
+            return False
+        next_completion_tokens = seq.num_raw_completion_tokens + 1
+        for stop_seq in self.stop_token_seqs:
+            stop_len = len(stop_seq)
+            if next_completion_tokens < stop_len:
+                continue
+            if stop_len == 1:
+                if token_id == stop_seq[0]:
+                    return True
+                continue
+            if tuple(seq.token_ids[-(stop_len - 1):]) == stop_seq[:-1] and token_id == stop_seq[-1]:
+                return True
+        return False
 
-    def _forward_hidden_one_token(
-        self,
-        token_id: int,
-        position: int,
-        context_len: int,
-        slot_in: int,
-        slot_out: int | None = None,
-    ) -> torch.Tensor:
-        if slot_out is None:
-            slot_out = slot_in
-        input_ids, positions, _ = self._prepare_decode_single_slots(
-            last_token=token_id,
-            position=position,
-            context_len=context_len,
-            slot_in=slot_in,
-            slot_out=slot_out,
-            copy_input_state=False,
-            prepare_graph=False,
-        )
-        try:
-            hidden = self.model.model.forward_one(input_ids, positions)
-        finally:
-            reset_context()
-        return hidden
+    def _is_hidden_finalize_batch(self, seqs: list[Sequence]) -> bool:
+        return self.config.rwkv_state_cache_enable and bool(seqs) and all(seq.pending_hidden_finalize for seq in seqs)
 
-    def _finalize_finished_sequence_cache(self, seq: Sequence, token_id: int) -> None:
-        if seq.state_slot is None:
-            return
-        if seq.active_state_slot is not None:
-            slot_in = int(seq.active_state_slot)
-            slot_out = int(seq.state_slot)
-        elif seq.state_slot_materialized:
-            slot_in = int(seq.state_slot)
-            slot_out = int(seq.state_slot)
-        else:
-            assert seq.prompt_cache_slot is not None
-            slot_in = int(seq.prompt_cache_slot)
-            slot_out = int(seq.state_slot)
-        hidden = self._forward_hidden_one_token(token_id, len(seq), len(seq) + 1, slot_in, slot_out)
-        if not seq.state_slot_materialized:
-            if self.rank == 0 and self.state_slot_manager is not None and seq.prompt_cache_slot is not None:
-                self.state_slot_manager.unpin_cached(seq.prompt_cache_slot)
-            seq.state_slot_materialized = True
-        self._publish_cached_slot(
-            seq.state_slot,
-            seq.token_ids + [token_id],
-            len(seq) + 1,
-            hidden[0],
-        )
-        seq.final_cache_published = True
+    def _store_decode_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.dim() == 1:
+            hidden_states = hidden_states.unsqueeze(0)
+        if not hasattr(self, "slot_last_hidden"):
+            return hidden_states
+        slot_mapping_out = get_context().slot_mapping_out
+        if slot_mapping_out is None:
+            return hidden_states
+        slot_index = slot_mapping_out.to(dtype=torch.int64)
+        self.slot_last_hidden.index_copy_(0, slot_index, hidden_states)
+        self.slot_last_hidden_valid.index_fill_(0, slot_index, True)
+        return hidden_states
 
-    def _after_bs1_decode_step(self, seq: Sequence) -> None:
-        graph_slot = self._shared_bs1_graph_slot()
-        if graph_slot is not None and seq.active_state_slot is None:
-            seq.active_state_slot = graph_slot
+    def _mark_state_slot_materialized(self, seq: Sequence, current_output_slot: int | None = None) -> None:
         if not self.config.rwkv_state_cache_enable or seq.state_slot_materialized:
             return
+        if current_output_slot is not None and seq.active_state_slot is None:
+            seq.active_state_slot = int(current_output_slot)
         if self.rank == 0 and self.state_slot_manager is not None and seq.prompt_cache_slot is not None:
             self.state_slot_manager.unpin_cached(seq.prompt_cache_slot)
         if seq.state_slot is not None:
@@ -663,6 +841,34 @@ class ModelRunner:
             if seq.active_state_slot is None:
                 seq.active_state_slot = int(seq.state_slot)
         seq.state_slot_materialized = True
+
+    def _publish_hidden_finalize_sequence(self, seq: Sequence) -> None:
+        if seq.state_slot is None:
+            return
+        if not seq.state_slot_materialized:
+            self._mark_state_slot_materialized(seq)
+        current_slot = self._seq_slot_for_decode(seq)
+        target_slot = int(seq.state_slot)
+        if current_slot != target_slot:
+            self._copy_slot_states([current_slot], [target_slot], copy_last_hidden=True)
+            current_slot = target_slot
+        if not bool(self.slot_last_hidden_valid[current_slot].item()):
+            raise RuntimeError("Hidden finalize is missing slot_last_hidden.")
+        self._publish_cached_slot(
+            target_slot,
+            seq.token_ids,
+            len(seq),
+            self.slot_last_hidden[current_slot],
+        )
+        seq.final_cache_published = True
+
+    def _after_bs1_decode_step(self, seq: Sequence) -> None:
+        graph_slot = self._shared_bs1_graph_slot()
+        if graph_slot is not None and seq.active_state_slot is None:
+            seq.active_state_slot = graph_slot
+        if not self.config.rwkv_state_cache_enable:
+            return
+        self._mark_state_slot_materialized(seq, seq.active_state_slot)
 
     def _ensure_bs1_decode_graph(self, input_ids: torch.Tensor, positions: torch.Tensor, greedy_only: bool):
         if self.config.enforce_eager:
@@ -780,11 +986,16 @@ class ModelRunner:
 
     def prepare_sample(self, seqs: list[Sequence]):
         if len(seqs) == 1:
-            if seqs[0].temperature <= GREEDY_TEMPERATURE_EPS:
+            seq = seqs[0]
+            if not _bs1_requires_sequence_sampler(
+                temperature=seq.temperature,
+                presence_penalty=seq.presence_penalty,
+                repetition_penalty=seq.repetition_penalty,
+            ):
                 return None
             if self._bs1_temperature is None:
                 self._bs1_temperature = torch.empty(1, dtype=torch.float32, device="cuda")
-            self._bs1_temperature[0] = seqs[0].temperature
+            self._bs1_temperature[0] = seq.temperature
             return self._bs1_temperature
         temperatures = []
         for seq in seqs:
@@ -797,27 +1008,63 @@ class ModelRunner:
         return self.model.forward_logits(input_ids, positions)
 
     @torch.inference_mode()
-    def _compute_prefill_logits_with_state_cache(self, seqs: list[Sequence]) -> torch.Tensor:
-        seq_to_row: dict[int, torch.Tensor] = {}
-        exact_seqs = [seq for seq in seqs if seq.exact_cache_hit]
-        prefill_seqs = [seq for seq in seqs if not seq.exact_cache_hit]
+    def _compute_prefill_logits_with_state_cache(
+        self,
+        seqs: list[Sequence],
+    ) -> tuple[torch.Tensor, float, float, int, int, int, int]:
+        ordered_rows: list[torch.Tensor | None] = [None] * len(seqs)
+        exact_items = [(index, seq) for index, seq in enumerate(seqs) if seq.exact_cache_hit]
+        prefill_items = [(index, seq) for index, seq in enumerate(seqs) if not seq.exact_cache_hit]
+        prepare_s = 0.0
+        forward_s = 0.0
+        prefill_exec_batches = 0
+        prefill_logical_tokens = 0
+        prefill_flat_padded_tokens = 0
+        prefill_bucketed_padded_tokens = 0
 
-        if prefill_seqs:
-            input_ids, positions = self.prepare_prefill(prefill_seqs)
-            hidden_states = self.model(input_ids, positions)
-            logits = self.model.compute_logits(hidden_states)
-            last_hidden = hidden_states[:, -1, :]
-            for row, seq in enumerate(prefill_seqs):
-                self._publish_cached_slot(seq.prompt_cache_slot, seq.prompt_token_ids, seq.num_prompt_tokens, last_hidden[row])
-                seq_to_row[seq.seq_id] = logits[row]
-                seq.state_slot_materialized = False
-                if self.rank == 0 and self.state_slot_manager is not None and seq.prompt_cache_slot is not None:
-                    self.state_slot_manager.pin_cached(seq.prompt_cache_slot)
-                if self.rank == 0 and self.state_slot_manager is not None and seq.cache_hit_slot is not None:
-                    self.state_slot_manager.unpin_cached(seq.cache_hit_slot)
-                    seq.cache_hit_slot = None
+        if prefill_items:
+            prefill_indices = [index for index, _ in prefill_items]
+            prefill_seqs = [seq for _, seq in prefill_items]
+            (
+                bucket_plan,
+                prefill_logical_tokens,
+                prefill_flat_padded_tokens,
+                prefill_bucketed_padded_tokens,
+            ) = self._prefill_bucket_plan(prefill_seqs)
+            prefill_exec_batches = len(bucket_plan)
+            for bucket in bucket_plan:
+                bucket_indices = [prefill_indices[index] for index in bucket]
+                bucket_seqs = [prefill_seqs[index] for index in bucket]
+                prepare_started_at = time.perf_counter()
+                input_ids, positions = self.prepare_prefill(bucket_seqs)
+                prepare_s += time.perf_counter() - prepare_started_at
+                try:
+                    forward_started_at = time.perf_counter()
+                    hidden_states = self.model(input_ids, positions)
+                    logits = self.model.compute_logits(hidden_states)
+                    forward_s += time.perf_counter() - forward_started_at
+                    last_hidden = hidden_states[:, -1, :]
+                    for row, (original_index, seq) in enumerate(zip(bucket_indices, bucket_seqs, strict=True)):
+                        processed_prefix_len = seq.num_cached_tokens + self._prefill_step_tokens(seq)
+                        self._publish_cached_slot(
+                            seq.prompt_cache_slot,
+                            seq.prompt_token_ids,
+                            processed_prefix_len,
+                            last_hidden[row],
+                        )
+                        ordered_rows[original_index] = logits[row]
+                        seq.state_slot_materialized = False
+                        if self.rank == 0 and self.state_slot_manager is not None and seq.prompt_cache_slot is not None:
+                            self.state_slot_manager.pin_cached(seq.prompt_cache_slot)
+                        if self.rank == 0 and self.state_slot_manager is not None and seq.cache_hit_slot is not None:
+                            self.state_slot_manager.unpin_cached(seq.cache_hit_slot)
+                            seq.cache_hit_slot = None
+                finally:
+                    reset_context()
 
-        if exact_seqs:
+        if exact_items:
+            exact_indices = [index for index, _ in exact_items]
+            exact_seqs = [seq for _, seq in exact_items]
             valid = self.slot_last_hidden_valid.index_select(
                 0,
                 torch.tensor([int(seq.prompt_cache_slot) for seq in exact_seqs], dtype=torch.int64, device=self.state_cache.device),
@@ -828,14 +1075,80 @@ class ModelRunner:
                 0,
                 torch.tensor([int(seq.prompt_cache_slot) for seq in exact_seqs], dtype=torch.int64, device=self.state_cache.device),
             )
+            forward_started_at = time.perf_counter()
             logits = self.model.compute_logits(hidden)
-            for row, seq in enumerate(exact_seqs):
-                seq_to_row[seq.seq_id] = logits[row]
+            forward_s += time.perf_counter() - forward_started_at
+            for row, (original_index, seq) in enumerate(zip(exact_indices, exact_seqs, strict=True)):
+                ordered_rows[original_index] = logits[row]
                 seq.state_slot_materialized = False
 
-        ordered_logits = torch.stack([seq_to_row[seq.seq_id] for seq in seqs], dim=0)
-        reset_context()
-        return ordered_logits
+        ordered_logits = torch.stack(ordered_rows, dim=0)
+        return (
+            ordered_logits,
+            prepare_s,
+            forward_s,
+            prefill_logical_tokens,
+            prefill_flat_padded_tokens,
+            prefill_bucketed_padded_tokens,
+            prefill_exec_batches,
+        )
+
+    @torch.inference_mode()
+    def _compute_prefill_logits_bucketed(
+        self,
+        seqs: list[Sequence],
+    ) -> tuple[torch.Tensor, float, float, int, int, int, int]:
+        (
+            bucket_plan,
+            prefill_logical_tokens,
+            prefill_flat_padded_tokens,
+            prefill_bucketed_padded_tokens,
+        ) = self._prefill_bucket_plan(seqs)
+        prepare_s = 0.0
+        forward_s = 0.0
+        if len(bucket_plan) == 1 and bucket_plan[0] == list(range(len(seqs))):
+            prepare_started_at = time.perf_counter()
+            input_ids, positions = self.prepare_prefill(seqs)
+            prepare_s = time.perf_counter() - prepare_started_at
+            try:
+                forward_started_at = time.perf_counter()
+                logits = self.run_model(input_ids, positions, True)
+                forward_s = time.perf_counter() - forward_started_at
+            finally:
+                reset_context()
+            return (
+                logits,
+                prepare_s,
+                forward_s,
+                prefill_logical_tokens,
+                prefill_flat_padded_tokens,
+                prefill_bucketed_padded_tokens,
+                1,
+            )
+
+        ordered_rows: list[torch.Tensor | None] = [None] * len(seqs)
+        for bucket in bucket_plan:
+            bucket_seqs = [seqs[index] for index in bucket]
+            prepare_started_at = time.perf_counter()
+            input_ids, positions = self.prepare_prefill(bucket_seqs)
+            prepare_s += time.perf_counter() - prepare_started_at
+            try:
+                forward_started_at = time.perf_counter()
+                logits = self.run_model(input_ids, positions, True)
+                forward_s += time.perf_counter() - forward_started_at
+                for row, original_index in enumerate(bucket):
+                    ordered_rows[original_index] = logits[row]
+            finally:
+                reset_context()
+        return (
+            torch.stack(ordered_rows, dim=0),
+            prepare_s,
+            forward_s,
+            prefill_logical_tokens,
+            prefill_flat_padded_tokens,
+            prefill_bucketed_padded_tokens,
+            len(bucket_plan),
+        )
 
     @torch.inference_mode()
     def _compute_decode_logits_with_state_cache(self, seqs: list[Sequence]) -> torch.Tensor:
@@ -854,51 +1167,143 @@ class ModelRunner:
                 )
             else:
                 input_ids, positions = self.prepare_decode([seq])
-            logits = self.model.forward_one_logits(input_ids, positions)
-            if not seq.state_slot_materialized:
-                if self.rank == 0 and self.state_slot_manager is not None and seq.prompt_cache_slot is not None:
-                    self.state_slot_manager.unpin_cached(seq.prompt_cache_slot)
-                self._invalidate_bs1_slot_graphs(int(seq.state_slot))
-                seq.state_slot_materialized = True
+            hidden_states = self.model.model.forward_one(input_ids, positions)
+            hidden_states = self._store_decode_hidden(hidden_states)
+            logits = self.model.compute_logits(hidden_states)
+            slot_mapping_out = get_context().slot_mapping_out
+            current_output_slot = None
+            if slot_mapping_out is not None and slot_mapping_out.numel() > 0:
+                current_output_slot = int(slot_mapping_out[0].item())
+            self._mark_state_slot_materialized(seq, current_output_slot)
             reset_context()
             return logits
         input_ids, positions = self.prepare_decode(seqs)
-        logits = self.run_model(input_ids, positions, False)
-        for seq in seqs:
-            if seq.state_slot_materialized:
-                continue
-            if self.rank == 0 and self.state_slot_manager is not None and seq.prompt_cache_slot is not None:
-                self.state_slot_manager.unpin_cached(seq.prompt_cache_slot)
-            self._invalidate_bs1_slot_graphs(int(seq.state_slot))
-            seq.state_slot_materialized = True
+        hidden_states = self.model(input_ids, positions)
+        hidden_states = self._store_decode_hidden(hidden_states)
+        logits = self.model.compute_logits(hidden_states)
+        slot_mapping_out = get_context().slot_mapping_out
+        for row, seq in enumerate(seqs):
+            current_output_slot = None
+            if slot_mapping_out is not None:
+                current_output_slot = int(slot_mapping_out[row].item())
+            self._mark_state_slot_materialized(seq, current_output_slot)
         reset_context()
         return logits
 
     @torch.inference_mode()
     def run_logits(self, seqs: list[Sequence], is_prefill: bool):
+        prepare_s = 0.0
+        forward_s = 0.0
+        prefill_exec_batches = 0
+        prefill_logical_tokens = 0
+        prefill_flat_padded_tokens = 0
+        prefill_bucketed_padded_tokens = 0
         if self.config.rwkv_state_cache_enable:
             if is_prefill:
-                return self._compute_prefill_logits_with_state_cache(seqs)
-            return self._compute_decode_logits_with_state_cache(seqs)
+                (
+                    logits,
+                    prepare_s,
+                    forward_s,
+                    prefill_logical_tokens,
+                    prefill_flat_padded_tokens,
+                    prefill_bucketed_padded_tokens,
+                    prefill_exec_batches,
+                ) = self._compute_prefill_logits_with_state_cache(seqs)
+            else:
+                started_at = time.perf_counter()
+                logits = self._compute_decode_logits_with_state_cache(seqs)
+                forward_s = time.perf_counter() - started_at
+            if self._run_profile is not None:
+                self._run_profile_prepare_s = prepare_s
+                self._run_profile_forward_s = forward_s
+                self._run_profile_prefill_exec_batches = prefill_exec_batches
+                self._run_profile_prefill_logical_tokens = prefill_logical_tokens
+                self._run_profile_prefill_flat_padded_tokens = prefill_flat_padded_tokens
+                self._run_profile_prefill_bucketed_padded_tokens = prefill_bucketed_padded_tokens
+            return logits
         if not is_prefill and len(seqs) == 1:
             seq = seqs[0]
+            prepare_started_at = time.perf_counter()
             input_ids, positions = self.prepare_decode([seq])
+            prepare_s = time.perf_counter() - prepare_started_at
+            forward_started_at = time.perf_counter()
             logits = self.model.forward_one_logits(input_ids, positions)
+            forward_s = time.perf_counter() - forward_started_at
             reset_context()
+            if self._run_profile is not None:
+                self._run_profile_prepare_s = prepare_s
+                self._run_profile_forward_s = forward_s
+                self._run_profile_prefill_exec_batches = 0
+                self._run_profile_prefill_logical_tokens = 0
+                self._run_profile_prefill_flat_padded_tokens = 0
+                self._run_profile_prefill_bucketed_padded_tokens = 0
             return logits
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        logits = self.run_model(input_ids, positions, is_prefill)
-        reset_context()
+        if is_prefill:
+            (
+                logits,
+                prepare_s,
+                forward_s,
+                prefill_logical_tokens,
+                prefill_flat_padded_tokens,
+                prefill_bucketed_padded_tokens,
+                prefill_exec_batches,
+            ) = self._compute_prefill_logits_bucketed(seqs)
+        else:
+            prepare_started_at = time.perf_counter()
+            input_ids, positions = self.prepare_decode(seqs)
+            prepare_s = time.perf_counter() - prepare_started_at
+            try:
+                forward_started_at = time.perf_counter()
+                logits = self.run_model(input_ids, positions, is_prefill)
+                forward_s = time.perf_counter() - forward_started_at
+            finally:
+                reset_context()
+        if self._run_profile is not None:
+            self._run_profile_prepare_s = prepare_s
+            self._run_profile_forward_s = forward_s
+            self._run_profile_prefill_exec_batches = prefill_exec_batches
+            self._run_profile_prefill_logical_tokens = prefill_logical_tokens
+            self._run_profile_prefill_flat_padded_tokens = prefill_flat_padded_tokens
+            self._run_profile_prefill_bucketed_padded_tokens = prefill_bucketed_padded_tokens
         return logits
 
-    def prepare_postprocess(self, seqs: list[Sequence], token_ids: list[int] | None) -> None:
-        if token_ids is None or self.rank != 0 or not self.config.rwkv_state_cache_enable:
+    def prepare_postprocess(self, seqs: list[Sequence], token_ids: list[int | None] | None) -> None:
+        if self.rank != 0:
             return
-        for seq, token_id in zip(seqs, token_ids):
-            if self._would_finish_after_token(seq, token_id):
-                self._finalize_finished_sequence_cache(seq, token_id)
+        for seq in seqs:
+            if seq.num_cached_tokens < seq.num_prompt_tokens:
+                seq.num_cached_tokens = min(
+                    seq.num_prompt_tokens,
+                    seq.num_cached_tokens + self._prefill_step_tokens(seq),
+                )
+        if not self.config.rwkv_state_cache_enable:
+            return
+        for seq in seqs:
+            if seq.pending_hidden_finalize:
+                self._publish_hidden_finalize_sequence(seq)
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int | None]:
+        step_started_at = time.perf_counter()
+        if not is_prefill and self._is_hidden_finalize_batch(seqs):
+            _ = self.run_logits(seqs, False)
+            if self.rank == 0:
+                token_ids = [None] * len(seqs)
+            else:
+                token_ids = None
+            post_started_at = time.perf_counter()
+            self.prepare_postprocess(seqs, token_ids)
+            post_s = time.perf_counter() - post_started_at
+            if self._run_profile is not None:
+                self._run_profile.record_step(
+                    kind="decode",
+                    seq_count=len(seqs),
+                    total_s=time.perf_counter() - step_started_at,
+                    prepare_s=self._run_profile_prepare_s,
+                    forward_s=self._run_profile_forward_s,
+                    sample_s=0.0,
+                    post_s=post_s,
+                )
+            return token_ids
         if not is_prefill and len(seqs) == 1:
             seq = seqs[0]
             input_ids, positions, temperatures = self.prepare_decode_single(seq)
@@ -909,9 +1314,75 @@ class ModelRunner:
                 token_ids = [int(token.item())]
             else:
                 token_ids = None
+            post_started_at = time.perf_counter()
             self.prepare_postprocess(seqs, token_ids)
+            post_s = time.perf_counter() - post_started_at
+            if self._run_profile is not None:
+                self._run_profile.record_step(
+                    kind="decode",
+                    seq_count=len(seqs),
+                    total_s=time.perf_counter() - step_started_at,
+                    prepare_s=0.0,
+                    forward_s=0.0,
+                    sample_s=0.0,
+                    post_s=post_s,
+                )
             return token_ids
         logits = self.run_logits(seqs, is_prefill)
-        token_ids = self.sampler(logits, seqs).tolist() if self.rank == 0 else None
+        sample_started_at = time.perf_counter()
+        if self.rank == 0:
+            if is_prefill:
+                sample_indices = [
+                    index
+                    for index, seq in enumerate(seqs)
+                    if seq.num_cached_tokens + self._prefill_step_tokens(seq) >= seq.num_prompt_tokens
+                ]
+                if not sample_indices:
+                    token_ids = [None] * len(seqs)
+                elif len(sample_indices) == len(seqs):
+                    token_ids = self.sampler(logits, seqs).tolist()
+                else:
+                    sample_logits = logits.index_select(
+                        0,
+                        torch.tensor(sample_indices, dtype=torch.int64, device=logits.device),
+                    )
+                    sampled = self.sampler(sample_logits, [seqs[index] for index in sample_indices]).tolist()
+                    token_ids = [None] * len(seqs)
+                    for index, token_id in zip(sample_indices, sampled, strict=True):
+                        token_ids[index] = token_id
+            else:
+                sample_indices = [index for index, seq in enumerate(seqs) if not seq.pending_hidden_finalize]
+                if not sample_indices:
+                    token_ids = [None] * len(seqs)
+                elif len(sample_indices) == len(seqs):
+                    token_ids = self.sampler(logits, seqs).tolist()
+                else:
+                    sample_logits = logits.index_select(
+                        0,
+                        torch.tensor(sample_indices, dtype=torch.int64, device=logits.device),
+                    )
+                    sampled = self.sampler(sample_logits, [seqs[index] for index in sample_indices]).tolist()
+                    token_ids = [None] * len(seqs)
+                    for index, token_id in zip(sample_indices, sampled, strict=True):
+                        token_ids[index] = token_id
+        else:
+            token_ids = None
+        sample_s = time.perf_counter() - sample_started_at
+        post_started_at = time.perf_counter()
         self.prepare_postprocess(seqs, token_ids)
+        post_s = time.perf_counter() - post_started_at
+        if self._run_profile is not None:
+            self._run_profile.record_step(
+                kind="prefill" if is_prefill else "decode",
+                seq_count=len(seqs),
+                total_s=time.perf_counter() - step_started_at,
+                prepare_s=self._run_profile_prepare_s,
+                forward_s=self._run_profile_forward_s,
+                sample_s=sample_s,
+                post_s=post_s,
+                prefill_exec_batches=self._run_profile_prefill_exec_batches if is_prefill else 0,
+                prefill_logical_tokens=self._run_profile_prefill_logical_tokens if is_prefill else 0,
+                prefill_flat_padded_tokens=self._run_profile_prefill_flat_padded_tokens if is_prefill else 0,
+                prefill_bucketed_padded_tokens=self._run_profile_prefill_bucketed_padded_tokens if is_prefill else 0,
+            )
         return token_ids

@@ -32,8 +32,12 @@ class LLMEngine:
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = get_rwkv_tokenizer()
         config.eos = self.tokenizer.eos_token_id
+        config.stop_token_seqs = self.tokenizer.get_default_stop_token_seqs()
+        self.model_runner.eos = config.eos
+        self.model_runner.stop_token_seqs = config.stop_token_seqs
         self.scheduler = Scheduler(config)
         if config.rwkv_state_cache_enable:
+            self.scheduler.prefix_index.cache_key_token_rewriter = self.tokenizer.canonicalize_state_cache_token_ids
             self.model_runner.attach_state_cache(self.scheduler.slot_manager, self.scheduler.prefix_index)
         atexit.register(self.exit)
 
@@ -53,13 +57,22 @@ class LLMEngine:
         seq = Sequence(prompt, sampling_params)
         seq.allow_sparse_penalty_state = True
         self.scheduler.add(seq)
+        return seq
+
+    def abort(self, seq_id: int) -> bool:
+        return self.scheduler.abort(seq_id)
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        prefill_tokens = (
+            sum(seq.prefill_step_tokens(self.scheduler.config.rwkv_prefill_chunk_size) for seq in seqs)
+            if is_prefill
+            else 0
+        )
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        num_tokens = prefill_tokens if is_prefill else -len(seqs)
         return outputs, num_tokens
 
     def is_finished(self):

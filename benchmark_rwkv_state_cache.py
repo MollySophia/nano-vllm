@@ -82,6 +82,7 @@ def run_suite(
     max_tokens: int,
     gpu_memory_utilization: float,
     max_state_slots: int,
+    rwkv_state_cache_safety_reserve_slots: int,
 ) -> dict[str, list[dict]]:
     llm = LLM(
         model_dir,
@@ -92,6 +93,7 @@ def run_suite(
         max_model_len=8192,
         gpu_memory_utilization=gpu_memory_utilization,
         max_state_slots=max_state_slots,
+        rwkv_state_cache_safety_reserve_slots=rwkv_state_cache_safety_reserve_slots,
         rwkv_state_cache_enable=cache_enable,
     )
     results = {"miss": [], "exact": [], "partial": []}
@@ -176,6 +178,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.95)
     parser.add_argument("--max-state-slots", type=int, default=-1)
+    parser.add_argument("--rwkv-state-cache-safety-reserve-slots", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -189,6 +192,7 @@ def main():
         max_model_len=8192,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_state_slots=args.max_state_slots,
+        rwkv_state_cache_safety_reserve_slots=args.rwkv_state_cache_safety_reserve_slots,
     )
     vocab_size = int(probe_llm.model_runner.config.model_config.vocab_size)
     probe_llm.exit()
@@ -210,6 +214,7 @@ def main():
         args.max_tokens,
         args.gpu_memory_utilization,
         args.max_state_slots,
+        args.rwkv_state_cache_safety_reserve_slots,
     )
     on = run_suite(
         model_dir,
@@ -221,12 +226,14 @@ def main():
         args.max_tokens,
         args.gpu_memory_utilization,
         args.max_state_slots,
+        args.rwkv_state_cache_safety_reserve_slots,
     )
 
     print(
         f"model={args.model_pth},prompt_length={args.prompt_length},partial_extra_length={args.partial_extra_length},"
         f"trials={args.trials},max_tokens={args.max_tokens},gpu_memory_utilization={args.gpu_memory_utilization:.2f},"
-        f"max_state_slots={args.max_state_slots}"
+        f"max_state_slots={args.max_state_slots},"
+        f"rwkv_state_cache_safety_reserve_slots={args.rwkv_state_cache_safety_reserve_slots}"
     )
     print(summarize("miss", off["miss"][:args.trials], on["miss"][:args.trials]))
     print(summarize("exact", off["exact"], on["exact"]))

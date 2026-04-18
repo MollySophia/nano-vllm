@@ -8,7 +8,7 @@ class SamplingParams:
     top_p: float = 1.0
     presence_penalty: float = 0.0
     repetition_penalty: float = 0.0
-    penalty_decay: float = 1.0
+    penalty_decay: float = 0.996
     max_tokens: int = 64
     ignore_eos: bool = False
 

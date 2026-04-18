@@ -33,6 +33,7 @@ class Sequence:
         self.final_cache_published = False
         self.state_slot_materialized = False
         self.active_state_slot: int | None = None
+        self.pending_hidden_finalize = False
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p
@@ -43,6 +44,8 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
         self.penalty_state: dict[int, float] = {}
         self.allow_sparse_penalty_state = False
+        self.hidden_completion_token_count = 0
+        self.last_token_hidden_from_output = False
 
     def __len__(self):
         return self.num_tokens
@@ -55,21 +58,48 @@ class Sequence:
         return self.status == SequenceStatus.FINISHED
 
     @property
-    def num_completion_tokens(self):
+    def num_raw_completion_tokens(self):
         return self.num_tokens - self.num_prompt_tokens
+
+    @property
+    def num_completion_tokens(self):
+        return max(0, self.num_raw_completion_tokens - self.hidden_completion_token_count)
+
+    @property
+    def num_prefill_tokens_remaining(self) -> int:
+        return max(0, self.num_prompt_tokens - self.num_cached_tokens)
 
     @property
     def prompt_token_ids(self):
         return self.token_ids[:self.num_prompt_tokens]
 
     @property
-    def completion_token_ids(self):
+    def raw_completion_token_ids(self):
+        if not hasattr(self, "token_ids"):
+            return []
         return self.token_ids[self.num_prompt_tokens:]
+
+    @property
+    def completion_token_ids(self):
+        if not hasattr(self, "token_ids"):
+            return []
+        if self.hidden_completion_token_count <= 0:
+            return self.raw_completion_token_ids
+        end = max(self.num_prompt_tokens, len(self.token_ids) - self.hidden_completion_token_count)
+        return self.token_ids[self.num_prompt_tokens:end]
 
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+
+    def prefill_step_tokens(self, chunk_size: int) -> int:
+        remaining = self.num_prefill_tokens_remaining
+        if remaining <= 0:
+            return 0
+        if chunk_size == -1:
+            return remaining
+        return min(remaining, chunk_size)
 
     def __getstate__(self):
         return (
@@ -85,6 +115,7 @@ class Sequence:
                 self.final_cache_published,
                 self.state_slot_materialized,
                 self.active_state_slot,
+                self.pending_hidden_finalize,
                 self.temperature,
                 self.top_k,
                 self.top_p,
@@ -95,7 +126,9 @@ class Sequence:
                 self.ignore_eos,
                 self.penalty_state,
                 self.allow_sparse_penalty_state,
-                self.token_ids if self.num_completion_tokens == 0 else self.last_token)
+                self.hidden_completion_token_count,
+                self.last_token_hidden_from_output,
+                self.token_ids if (self.num_raw_completion_tokens == 0 or self.hidden_completion_token_count > 0) else self.last_token)
 
     def __setstate__(self, state):
         (
@@ -111,6 +144,7 @@ class Sequence:
             self.final_cache_published,
             self.state_slot_materialized,
             self.active_state_slot,
+            self.pending_hidden_finalize,
             self.temperature,
             self.top_k,
             self.top_p,
@@ -121,8 +155,10 @@ class Sequence:
             self.ignore_eos,
             self.penalty_state,
             self.allow_sparse_penalty_state,
+            self.hidden_completion_token_count,
+            self.last_token_hidden_from_output,
         ) = state[:-1]
-        if self.num_completion_tokens == 0:
+        if isinstance(state[-1], list):
             self.token_ids = state[-1]
             self.last_token = self.token_ids[-1]
         else:

@@ -117,6 +117,54 @@ class SamplerGroupingTest(unittest.TestCase):
         )
         self.assertEqual(out.tolist(), [3, 3, 1, 2])
 
+    def test_forward_uses_whole_batch_fast_path_for_uniform_greedy(self):
+        sampler = Sampler()
+        logits = torch.tensor(
+            [
+                [0.1, 0.9, 0.2, 0.3],
+                [0.4, 0.2, 0.1, 0.8],
+                [0.2, 1.1, 0.4, 0.3],
+            ],
+            dtype=torch.float32,
+        )
+        seqs = [
+            _seq(temperature=0.0),
+            _seq(temperature=0.0),
+            _seq(temperature=0.0),
+        ]
+
+        with mock.patch.object(sampler, "_group_indices_by_sampling", side_effect=AssertionError("grouping should be skipped")):
+            out = sampler(logits, seqs)
+
+        self.assertEqual(out.tolist(), [1, 3, 1])
+
+    def test_forward_uses_whole_batch_fast_path_for_uniform_sampling(self):
+        sampler = Sampler()
+        logits = torch.tensor(
+            [
+                [0.1, 0.9, 0.2, 0.3],
+                [0.4, 0.2, 0.1, 0.8],
+            ],
+            dtype=torch.float32,
+        )
+        seqs = [
+            _seq(temperature=0.7, top_k=40, top_p=0.9),
+            _seq(temperature=0.7, top_k=40, top_p=0.9),
+        ]
+
+        with (
+            mock.patch.object(sampler, "_group_indices_by_sampling", side_effect=AssertionError("grouping should be skipped")),
+            mock.patch.object(
+                sampler,
+                "_sample_without_penalties",
+                return_value=torch.tensor([3, 1], dtype=torch.int64),
+            ) as sample_mock,
+        ):
+            out = sampler(logits, seqs)
+
+        sample_mock.assert_called_once()
+        self.assertEqual(out.tolist(), [3, 1])
+
 
 if __name__ == "__main__":
     unittest.main()
