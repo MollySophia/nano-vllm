@@ -920,20 +920,24 @@ async def run_single_benchmark(args) -> tuple[BenchmarkSummary, list[RequestMetr
     total_requests = args.total_requests
     if total_requests is None and args.duration is None:
         total_requests = 100
+    load_mode = getattr(args, "load_mode", "closed-loop")
+    max_in_flight = getattr(args, "max_in_flight", 0)
+    arrival_rate = getattr(args, "arrival_rate", 32.0)
     prompts = load_prompts(args.prompt_file, args.prompt, args.prompt_repeat)
     prompt_source = PromptSource(prompts, args.seed)
     stats = StatsCollector()
     timeout = httpx.Timeout(args.timeout, connect=args.connect_timeout)
-    max_connections = args.max_connections
+    max_connections = getattr(args, "max_connections", None)
     if max_connections is None:
-        if args.load_mode == "closed-loop":
+        if load_mode == "closed-loop":
             max_connections = args.users
         else:
             max_connections = max(256, args.users)
-            if args.max_in_flight > 0:
-                max_connections = max(max_connections, args.max_in_flight)
+            if max_in_flight > 0:
+                max_connections = max(max_connections, max_in_flight)
+    max_keepalive_connections_arg = getattr(args, "max_keepalive_connections", None)
     max_keepalive_connections = (
-        max_connections if args.max_keepalive_connections is None else args.max_keepalive_connections
+        max_connections if max_keepalive_connections_arg is None else max_keepalive_connections_arg
     )
     limits = httpx.Limits(
         max_connections=max_connections,
@@ -949,7 +953,7 @@ async def run_single_benchmark(args) -> tuple[BenchmarkSummary, list[RequestMetr
         if args.progress_interval > 0:
             progress_task = asyncio.create_task(progress_reporter(stats, started_at, args.progress_interval))
         try:
-            if args.load_mode == "closed-loop":
+            if load_mode == "closed-loop":
                 scheduler = RequestScheduler(total_requests, args.duration)
                 tasks = [
                     asyncio.create_task(
@@ -976,10 +980,10 @@ async def run_single_benchmark(args) -> tuple[BenchmarkSummary, list[RequestMetr
                 await asyncio.gather(*tasks)
             else:
                 await open_loop_driver(
-                    arrival_rate=args.arrival_rate,
+                    arrival_rate=arrival_rate,
                     total_requests=total_requests,
                     duration_s=args.duration,
-                    max_in_flight=args.max_in_flight,
+                    max_in_flight=max_in_flight,
                     stats=stats,
                     prompt_source=prompt_source,
                     client=client,
@@ -1002,12 +1006,12 @@ async def run_single_benchmark(args) -> tuple[BenchmarkSummary, list[RequestMetr
     config = {
         "run_label": getattr(args, "run_label", None),
         "base_url": args.base_url,
-        "load_mode": args.load_mode,
+        "load_mode": load_mode,
         "endpoint": args.endpoint,
         "model": args.model,
-        "users": args.users if args.load_mode == "closed-loop" else None,
-        "arrival_rate": args.arrival_rate if args.load_mode == "open-loop" else None,
-        "max_in_flight": args.max_in_flight if args.load_mode == "open-loop" else None,
+        "users": args.users if load_mode == "closed-loop" else None,
+        "arrival_rate": arrival_rate if load_mode == "open-loop" else None,
+        "max_in_flight": max_in_flight if load_mode == "open-loop" else None,
         "max_connections": max_connections,
         "total_requests": total_requests,
         "duration": args.duration,

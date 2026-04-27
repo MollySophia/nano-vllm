@@ -34,9 +34,10 @@ class Scheduler:
         return seq.prefill_step_tokens(self.rwkv_prefill_chunk_size)
 
     def _matches_stop_token_seq(self, seq: Sequence) -> bool:
-        if not self.stop_token_seqs:
+        stop_token_seqs = getattr(seq, "stop_token_seqs", self.stop_token_seqs)
+        if not stop_token_seqs:
             return False
-        for stop_seq in self.stop_token_seqs:
+        for stop_seq in stop_token_seqs:
             stop_len = len(stop_seq)
             if seq.num_raw_completion_tokens < stop_len:
                 continue

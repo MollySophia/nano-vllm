@@ -163,6 +163,96 @@ class OpenAIAPIEndpointsTest(unittest.TestCase):
             [([{"role": "user", "content": "Hello"}], False, True)],
         )
 
+    def test_lightning_private_v1_batch_uses_contents_shape(self):
+        with patched_test_client(completion_text="CHAT") as (client, llm, _factory):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "rwkv7",
+                    "contents": ["alpha", "beta"],
+                    "max_tokens": 4,
+                    "temperature": 0.2,
+                    "top_k": 7,
+                    "top_p": 0.6,
+                    "alpha_presence": 0.3,
+                    "alpha_frequency": 0.1,
+                    "alpha_decay": 0.9,
+                    "stream": False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["id"], "rwkv7-batch")
+        self.assertEqual(body["object"], "chat.completion")
+        self.assertEqual(body["model"], "rwkv7")
+        self.assertEqual([choice["message"]["content"] for choice in body["choices"]], ["CHAT", "CHAT"])
+        self.assertEqual([req["prompt_text"] for req in llm.received_requests], ["alpha", "beta"])
+        self.assertEqual(llm.received_requests[0]["sampling_params"].top_k, 7)
+        self.assertAlmostEqual(llm.received_requests[0]["sampling_params"].presence_penalty, 0.3)
+        self.assertAlmostEqual(llm.received_requests[0]["sampling_params"].repetition_penalty, 0.1)
+        self.assertAlmostEqual(llm.received_requests[0]["sampling_params"].penalty_decay, 0.9)
+
+    def test_lightning_private_v2_and_password_body_are_supported(self):
+        with patched_test_client(api_key="secret", chat_text="OK") as (client, llm, _factory):
+            unauthorized = client.post(
+                "/v2/chat/completions",
+                json={"contents": ["alpha"], "max_tokens": 2},
+            )
+            authorized = client.post(
+                "/v2/chat/completions",
+                json={"contents": ["alpha"], "max_tokens": 2, "password": "secret"},
+            )
+
+        self.assertEqual(unauthorized.status_code, 401)
+        self.assertEqual(authorized.status_code, 200)
+        self.assertEqual(authorized.json()["choices"][0]["message"]["content"], "OK")
+        self.assertEqual(llm.received_requests[0]["prompt_text"], "alpha")
+
+    def test_lightning_openai_compat_route_accepts_alpha_fields(self):
+        with patched_test_client(api_key="secret", chat_text="OK") as (client, llm, _factory):
+            response = client.post(
+                "/openai/v1/chat/completions",
+                headers={"Authorization": "Bearer secret"},
+                json={
+                    "model": "rwkv7",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 4,
+                    "top_k": 3,
+                    "top_p": 0.3,
+                    "alpha_presence": 0.4,
+                    "alpha_frequency": 0.2,
+                    "stream": False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["choices"][0]["message"]["content"], "OK")
+        self.assertEqual(
+            llm.received_requests[0]["prompt_text"],
+            "User: Hello\n\nAssistant: <think>\n</think>\n",
+        )
+        self.assertEqual(llm.received_requests[0]["sampling_params"].top_k, 3)
+        self.assertAlmostEqual(llm.received_requests[0]["sampling_params"].top_p, 0.3)
+        self.assertAlmostEqual(llm.received_requests[0]["sampling_params"].presence_penalty, 0.4)
+
+    def test_lightning_state_status_and_delete_track_sessions(self):
+        with patched_test_client(chat_text="OK") as (client, _llm, _factory):
+            first = client.post(
+                "/state/chat/completions",
+                json={"contents": ["User: hello\n\nAssistant:"], "session_id": "s1", "max_tokens": 2},
+            )
+            status = client.post("/state/status", json={})
+            deleted = client.post("/state/delete", json={"session_id": "s1"})
+            status_after = client.post("/state/status", json={})
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["total_sessions"], 1)
+        self.assertEqual(status.json()["sessions"][0]["session_id"], "s1")
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(status_after.json()["total_sessions"], 0)
+
     def test_sync_completion_does_not_use_chat_template_when_available(self):
         tokenizer = FakeTemplateTokenizer(template_text="<CHAT> templated prompt")
         with patched_test_client(tokenizer=tokenizer, completion_text="OK") as (client, llm, _factory):

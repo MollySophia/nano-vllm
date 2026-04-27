@@ -275,7 +275,7 @@ class BenchmarkOpenAIAPIIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metric.status_code, 200)
         self.assertEqual(metric.response_chars, 4)
         self.assertEqual(metric.finish_reason, "stop")
-        self.assertEqual(metric.prompt_tokens, len("User: hello\n\nAssistant:"))
+        self.assertEqual(metric.prompt_tokens, len("User: hello\nAssistant:"))
         self.assertIsNotNone(metric.ttft_s)
         self.assertGreater(metric.ttft_s, 0.0)
 

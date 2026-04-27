@@ -389,6 +389,7 @@ class Sampler(nn.Module):
             return ("greedy", 0.0, 1, 0.0, 0.0, 0.0, 1.0)
         temperature = self._bucket_value(seq.temperature, self.temperature_bucket_resolution)
         top_p = self._bucket_value(seq.top_p, self.top_p_bucket_resolution)
+        penalty_decay = float(seq.penalty_decay) if uses_penalties else 1.0
         return (
             "sample",
             temperature,
@@ -396,7 +397,7 @@ class Sampler(nn.Module):
             top_p,
             float(seq.presence_penalty),
             float(seq.repetition_penalty),
-            float(seq.penalty_decay),
+            penalty_decay,
         )
 
     def _bucket_value(self, value: float, resolution: float) -> float:

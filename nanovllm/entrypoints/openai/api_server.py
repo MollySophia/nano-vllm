@@ -215,6 +215,7 @@ class PreparedOpenAIRequest:
     capture_logprobs: bool = False
     top_logprobs: int = 0
     echo: bool = False
+    stop_token_seqs: tuple[tuple[int, ...], ...] = ()
 
 
 class FrontendResponseBridge:
@@ -508,6 +509,7 @@ class BatchedRequest:
     prompt_logprob_records: list[TokenLogprobRecord] = field(default_factory=list)
     completion_logprob_records: list[TokenLogprobRecord] = field(default_factory=list)
     cancelled: bool = False
+    stop_token_seqs: tuple[tuple[int, ...], ...] = ()
 
     @property
     def ready_at(self) -> float | None:
@@ -1428,6 +1430,8 @@ class RequestBatcher:
                     add_request_s = time.perf_counter() - add_request_started_at
                     if request.prompt_scoring_token_ids:
                         seq.ignore_eos = True
+                    if request.stop_token_seqs:
+                        seq.stop_token_seqs = request.stop_token_seqs
                     request.seq_id = seq.seq_id
                     self._active[seq.seq_id] = request
                     if self._profile is not None:
@@ -1741,6 +1745,7 @@ def _serialize_prepared_request(prepared: PreparedOpenAIRequest) -> dict[str, An
         "capture_logprobs": bool(prepared.capture_logprobs),
         "top_logprobs": int(prepared.top_logprobs),
         "echo": bool(prepared.echo),
+        "stop_token_seqs": [list(seq) for seq in prepared.stop_token_seqs],
     }
 
 
@@ -1753,6 +1758,7 @@ def _deserialize_prepared_request(payload: dict[str, Any]) -> PreparedOpenAIRequ
         capture_logprobs=bool(payload.get("capture_logprobs", False)),
         top_logprobs=int(payload.get("top_logprobs", 0)),
         echo=bool(payload.get("echo", False)),
+        stop_token_seqs=tuple(tuple(int(token_id) for token_id in seq) for seq in payload.get("stop_token_seqs", ())),
     )
 
 
@@ -2505,6 +2511,7 @@ def _submit_request(
         capture_logprobs=prepared.capture_logprobs,
         top_logprobs=prepared.top_logprobs,
         echo=prepared.echo,
+        stop_token_seqs=prepared.stop_token_seqs,
         created=created,
         http_received_at=http_received_at,
         handler_started_at=handler_started_at,
@@ -2896,6 +2903,488 @@ async def _serve_chat_completion_request(
     )
 
 
+def _is_lightning_private_payload(payload: dict[str, Any]) -> bool:
+    return "contents" in payload or "prefix" in payload or "suffix" in payload
+
+
+def _private_request_model(payload: dict[str, Any], state: Any) -> str:
+    value = payload.get("model")
+    if value is None:
+        return getattr(state, "model_id", "rwkv7")
+    if not isinstance(value, str):
+        raise _invalid_request_body("Field model must be a string.")
+    return value
+
+
+def _require_private_api_key(state: Any, authorization: str | None, payload: dict[str, Any]) -> None:
+    api_key = getattr(state, "api_key", None)
+    if api_key is None:
+        return
+    if authorization == f"Bearer {api_key}":
+        return
+    if payload.get("password") == api_key:
+        return
+    raise OpenAIAPIError(
+        401,
+        "Invalid or missing API key.",
+        error_type="authentication_error",
+        code="invalid_api_key",
+    )
+
+
+def _lightning_string_list(payload: dict[str, Any], field_name: str, default=None) -> list[str]:
+    if field_name not in payload:
+        return list(default or [])
+    value = payload[field_name]
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise _invalid_request_body(f"Field {field_name} must be a list of strings.")
+    return list(value)
+
+
+def _lightning_sampling_params(payload: dict[str, Any]) -> SamplingParams:
+    max_tokens = _optional_int(payload, "max_tokens", DEFAULT_OPENAI_MAX_TOKENS)
+    temperature = _optional_float(payload, "temperature", 1.0)
+    top_k = _optional_int(payload, "top_k", 50)
+    top_p = _optional_float(payload, "top_p", 0.6)
+    alpha_presence = _optional_float(payload, "alpha_presence", 2.0)
+    alpha_frequency = _optional_float(payload, "alpha_frequency", 0.2)
+    alpha_decay = _optional_float(payload, "alpha_decay", DEFAULT_OPENAI_PENALTY_DECAY)
+    if max_tokens is None or max_tokens <= 0:
+        raise OpenAIAPIError(400, "max_tokens must be positive.", param="max_tokens")
+    if temperature is None or temperature < 0:
+        raise OpenAIAPIError(400, "temperature must be non-negative.", param="temperature")
+    if top_k is None:
+        top_k = -1
+    if top_k != -1 and top_k <= 0:
+        raise OpenAIAPIError(400, "top_k must be -1 or a positive integer.", param="top_k")
+    if top_p is None or not (0.0 <= top_p <= 1.0):
+        raise OpenAIAPIError(400, "top_p must be in [0, 1].", param="top_p")
+    if alpha_decay is None or not (0.0 <= alpha_decay <= 1.0):
+        raise OpenAIAPIError(400, "alpha_decay must be in [0, 1].", param="alpha_decay")
+    return SamplingParams(
+        temperature=float(temperature),
+        top_k=int(top_k),
+        top_p=float(top_p),
+        presence_penalty=float(alpha_presence or 0.0),
+        repetition_penalty=float(alpha_frequency or 0.0),
+        penalty_decay=float(alpha_decay),
+        max_tokens=int(max_tokens),
+    )
+
+
+def _lightning_stop_token_seqs(state: Any, payload: dict[str, Any]) -> tuple[tuple[int, ...], ...]:
+    stop_tokens = _lightning_string_list(payload, "stop_tokens", ["\nUser:"])
+    tokenizer = _state_tokenizer(state)
+    encoded = []
+    for stop_text in stop_tokens:
+        token_ids = tokenizer.encode(stop_text)
+        if token_ids:
+            encoded.append(tuple(int(token_id) for token_id in token_ids))
+    return tuple(encoded)
+
+
+def _lightning_prepared_requests(
+    state: Any,
+    payload: dict[str, Any],
+    prompts: list[str],
+    *,
+    pad_zero: bool | None = None,
+) -> list[PreparedOpenAIRequest]:
+    sampling_params = _lightning_sampling_params(payload)
+    stop_token_seqs = _lightning_stop_token_seqs(state, payload)
+    if pad_zero is None:
+        pad_zero = bool(payload.get("pad_zero", False))
+    prepared_requests = []
+    for prompt in prompts:
+        prompt_text = prompt
+        prompt_token_ids = None
+        if pad_zero:
+            prompt_token_ids = [0] + _state_encode_text(state, prompt)
+            prompt_text = None
+        prepared_requests.append(
+            PreparedOpenAIRequest(
+                prompt_text=prompt_text,
+                prompt_token_ids=prompt_token_ids,
+                sampling_params=sampling_params,
+                requested_max_tokens=int(sampling_params.max_tokens),
+                stop_token_seqs=stop_token_seqs,
+            )
+        )
+    return prepared_requests
+
+
+def _lightning_response_choice(index: int, text: str, finish_reason: str) -> dict[str, Any]:
+    return {
+        "index": index,
+        "message": {"role": "assistant", "content": text},
+        "finish_reason": finish_reason,
+    }
+
+
+def _lightning_session_store(state: Any) -> dict[str, str]:
+    sessions = getattr(state, "lightning_sessions", None)
+    if sessions is None:
+        sessions = {}
+        setattr(state, "lightning_sessions", sessions)
+    return sessions
+
+
+def _lightning_session_lock(state: Any):
+    lock = getattr(state, "lightning_sessions_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        setattr(state, "lightning_sessions_lock", lock)
+    return lock
+
+
+def _lightning_prompt_with_session(state: Any, session_id: str | None, prompt: str) -> tuple[str, str | None]:
+    if not session_id:
+        return prompt, None
+    sessions = _lightning_session_store(state)
+    lock = _lightning_session_lock(state)
+    with lock:
+        history = sessions.get(session_id, "")
+    if history:
+        return history + ("\n\n" + prompt if prompt and not prompt.startswith("\n\n") else prompt), history
+    return prompt, ""
+
+
+def _lightning_update_session(state: Any, session_id: str | None, prompt: str, completion: str) -> None:
+    if not session_id:
+        return
+    sessions = _lightning_session_store(state)
+    lock = _lightning_session_lock(state)
+    with lock:
+        sessions[session_id] = prompt + completion
+
+
+async def _serve_lightning_private_chat(
+    state: ServerState,
+    payload: dict[str, Any],
+    *,
+    authorization: str | None,
+    http_received_at: float,
+    handler_started_at: float,
+    response_object: str = "chat.completion",
+    response_id: str = "rwkv7-batch",
+    state_session_id: str | None = None,
+    force_single_prompt: bool = False,
+) -> Response:
+    _require_private_api_key(state, authorization, payload)
+    prompts = _lightning_string_list(payload, "contents")
+    if not prompts:
+        raise OpenAIAPIError(400, "Empty prompts list.", param="contents")
+    if force_single_prompt and len(prompts) != 1:
+        raise OpenAIAPIError(500, "Server Error: Request must be single prompt!", error_type="server_error")
+
+    session_prompt = None
+    session_id = state_session_id or payload.get("session_id")
+    if session_id is not None and not isinstance(session_id, str):
+        raise _invalid_request_body("Field session_id must be a string.")
+    if state_session_id is not None or payload.get("session_id") is not None:
+        prompts[0], _ = _lightning_prompt_with_session(state, session_id, prompts[0])
+        session_prompt = prompts[0]
+
+    stream = bool(_optional_bool(payload, "stream", False))
+    model_name = _private_request_model(payload, state)
+    prepared_requests = _lightning_prepared_requests(state, payload, prompts)
+    created = int(time.time())
+    request_group_id = f"rwkv-lightning-{uuid.uuid4().hex}"
+    requests = [
+        _submit_request(
+            state,
+            endpoint="chat",
+            prepared=prepared,
+            request_id=f"{request_group_id}-{index}",
+            created=created,
+            http_received_at=http_received_at,
+            handler_started_at=handler_started_at,
+            stream=stream,
+        )
+        for index, prepared in enumerate(prepared_requests)
+    ]
+
+    if not stream:
+        await asyncio.gather(*(request.done_event.wait() for request in requests if request.done_event is not None))
+        choices = []
+        completion_texts = []
+        for index, request in enumerate(requests):
+            _raise_request_error(request)
+            result = request.result()
+            completion_texts.append(result.text)
+            choices.append(_lightning_response_choice(index, result.text, result.finish_reason))
+        if session_prompt is not None and completion_texts:
+            _lightning_update_session(state, session_id, session_prompt, completion_texts[0])
+        return _json_response(
+            {
+                "id": response_id,
+                "object": response_object,
+                "model": model_name,
+                "choices": choices,
+            }
+        )
+
+    await asyncio.gather(*(request.ready_event.wait() for request in requests if request.ready_event is not None))
+    for request in requests:
+        _raise_request_error(request)
+
+    async def event_stream():
+        tasks: dict[asyncio.Task, int] = {}
+        completion_buffers = [""] * len(requests)
+        completed = set()
+        try:
+            for index, request in enumerate(requests):
+                assert request.stream_queue is not None
+                tasks[asyncio.create_task(request.stream_queue.get())] = index
+            while tasks:
+                done, _pending = await asyncio.wait(tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    index = tasks.pop(task)
+                    request = requests[index]
+                    kind, value = task.result()
+                    if kind == "delta":
+                        text = value or ""
+                        completion_buffers[index] += text
+                        yield _sse_payload(
+                            {
+                                "object": "chat.completion.chunk",
+                                "choices": [{"index": index, "delta": {"content": text}}],
+                            }
+                        )
+                        assert request.stream_queue is not None
+                        tasks[asyncio.create_task(request.stream_queue.get())] = index
+                        continue
+                    if kind == "finish":
+                        assert request.stream_queue is not None
+                        tasks[asyncio.create_task(request.stream_queue.get())] = index
+                        continue
+                    if kind == "error":
+                        _raise_request_error(request)
+                    if kind == "done":
+                        completed.add(index)
+            if session_prompt is not None and completion_buffers:
+                _lightning_update_session(state, session_id, session_prompt, completion_buffers[0])
+            yield _sse_payload("[DONE]")
+        finally:
+            for task in tasks:
+                task.cancel()
+            for index, request in enumerate(requests):
+                if index not in completed:
+                    state.batcher.cancel(request)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+def _lightning_translation_prompt(source_lang: str, target_lang: str, text: str) -> str:
+    lang_names = {
+        "zh-CN": "Chinese",
+        "zh-TW": "Chinese",
+        "en": "English",
+        "ja": "Japanese",
+        "fr": "French",
+        "de": "German",
+        "es": "Spanish",
+        "ru": "Russian",
+    }
+    source_name = lang_names.get(source_lang, source_lang)
+    target_name = lang_names.get(target_lang, target_lang)
+    return f"{source_name}: {text}\n\n{target_name}:"
+
+
+async def _serve_lightning_translate(
+    state: ServerState,
+    payload: dict[str, Any],
+    *,
+    authorization: str | None,
+    http_received_at: float,
+    handler_started_at: float,
+) -> Response:
+    _require_private_api_key(state, authorization, payload)
+    target_lang = _require_string(payload, "target_lang")
+    source_lang = payload.get("source_lang", "auto")
+    if not isinstance(source_lang, str):
+        raise _invalid_request_body("Field source_lang must be a string.")
+    text_list = _lightning_string_list(payload, "text_list")
+    prompts = [_lightning_translation_prompt(source_lang, target_lang, text) for text in text_list]
+    translate_payload = {
+        **payload,
+        "contents": prompts,
+        "max_tokens": payload.get("max_tokens", 2048),
+        "temperature": payload.get("temperature", 1.0),
+        "top_k": payload.get("top_k", 1),
+        "top_p": payload.get("top_p", 0.0),
+        "alpha_presence": payload.get("alpha_presence", 0.0),
+        "alpha_frequency": payload.get("alpha_frequency", 0.0),
+        "stop_tokens": payload.get("stop_tokens", []),
+        "stream": False,
+    }
+    response = await _serve_lightning_private_chat(
+        state,
+        translate_payload,
+        authorization=authorization,
+        http_received_at=http_received_at,
+        handler_started_at=handler_started_at,
+    )
+    body = _json_decode(response.body)
+    translations = [
+        {
+            "detected_source_lang": source_lang if source_lang != "auto" else "en",
+            "text": choice["message"]["content"].strip(),
+        }
+        for choice in body.get("choices", [])
+    ]
+    return _json_response({"translations": translations})
+
+
+def _openai_compat_prompt_parts(body: dict[str, Any]) -> tuple[str, list[str]]:
+    system_parts = []
+    transcript_parts = []
+    system = body.get("system")
+    if isinstance(system, str) and system.strip():
+        system_parts.append(system.strip())
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "user")).lower()
+        content = _coerce_text_content(message.get("content")).strip()
+        if not content:
+            continue
+        if role in {"system", "developer"}:
+            system_parts.append(content)
+        elif role == "assistant":
+            transcript_parts.append(f"Assistant: {content}")
+        else:
+            transcript_parts.append(f"User: {content}")
+    contents = body.get("contents") or []
+    if isinstance(contents, list) and contents and isinstance(contents[0], str) and contents[0].strip():
+        transcript_parts.append(f"User: {contents[0].strip()}")
+    return "\n".join(system_parts).strip(), transcript_parts
+
+
+def _format_lightning_openai_prompt(body: dict[str, Any]) -> str:
+    system_text, transcript_parts = _openai_compat_prompt_parts(body)
+    prompt_parts = []
+    if system_text:
+        prompt_parts.append(f"System: {system_text}")
+    prompt_parts.extend(transcript_parts)
+    prompt_text = "\n\n".join(part for part in prompt_parts if part).strip()
+    if not prompt_text:
+        raise OpenAIAPIError(400, "OpenAI chat completions require system or user text.", param="messages")
+    if bool(body.get("enable_think", False)):
+        return f"{prompt_text}\n\nAssistant: <think"
+    return f"{prompt_text}\n\nAssistant: <think>\n</think>\n"
+
+
+async def _serve_lightning_openai_compat_chat(
+    state: ServerState,
+    payload: dict[str, Any],
+    *,
+    authorization: str | None,
+    http_received_at: float,
+    handler_started_at: float,
+) -> Response:
+    _require_private_api_key(state, authorization, payload)
+    prompt = _format_lightning_openai_prompt(payload)
+    private_payload = {**payload, "contents": [prompt]}
+    private_payload.setdefault("stream", bool(payload.get("stream", False)))
+    private_payload.setdefault("max_tokens", payload.get("max_completion_tokens", payload.get("max_tokens", DEFAULT_OPENAI_MAX_TOKENS)))
+    private_payload.setdefault("alpha_presence", payload.get("presence_penalty", payload.get("alpha_presence", 1.0)))
+    private_payload.setdefault("alpha_frequency", payload.get("frequency_penalty", payload.get("alpha_frequency", 0.1)))
+    private_payload.setdefault("alpha_decay", payload.get("penalty_decay", payload.get("alpha_decay", DEFAULT_OPENAI_PENALTY_DECAY)))
+    stream = bool(_optional_bool(private_payload, "stream", False))
+    prepared = _lightning_prepared_requests(state, private_payload, [prompt], pad_zero=False)[0]
+    created = int(time.time())
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    model_name = _private_request_model(payload, state)
+    request = _submit_request(
+        state,
+        endpoint="chat",
+        prepared=prepared,
+        request_id=completion_id,
+        created=created,
+        http_received_at=http_received_at,
+        handler_started_at=handler_started_at,
+        stream=stream,
+    )
+    if stream:
+        assert request.ready_event is not None
+        await request.ready_event.wait()
+        _raise_request_error(request)
+
+        async def event_stream():
+            completed = False
+            try:
+                yield _sse_payload(
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    }
+                )
+                assert request.stream_queue is not None
+                while True:
+                    kind, value = await request.stream_queue.get()
+                    if kind == "delta":
+                        yield _sse_payload(
+                            {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [{"index": 0, "delta": {"content": value or ""}, "finish_reason": None}],
+                            }
+                        )
+                        continue
+                    if kind == "finish":
+                        yield _sse_payload(
+                            {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": _chat_stream_finish_reason(value or "stop")}],
+                            }
+                        )
+                        continue
+                    if kind == "error":
+                        completed = True
+                        _raise_request_error(request)
+                    if kind == "done":
+                        completed = True
+                        yield _sse_payload("[DONE]")
+                        return
+            finally:
+                if not completed:
+                    state.batcher.cancel(request)
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    assert request.done_event is not None
+    await request.done_event.wait()
+    _raise_request_error(request)
+    result = request.result()
+    return _json_response(
+        {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": result.text},
+                    "finish_reason": result.finish_reason,
+                }
+            ],
+            "usage": _usage_dict(len(result.prompt_token_ids), len(result.completion_token_ids)),
+        }
+    )
+
+
 def _prepare_request_from_payload(
     state: Any,
     *,
@@ -3057,11 +3546,169 @@ def create_app(
             "nanovllm_received_at",
             time.perf_counter(),
         )
-        req = _parse_chat_request_payload(await _load_json_body(request_http))
+        payload = await _load_json_body(request_http)
         handler_started_at = time.perf_counter()
+        if _is_lightning_private_payload(payload):
+            return await _serve_lightning_private_chat(
+                app.state.server,
+                payload,
+                authorization=authorization,
+                http_received_at=http_received_at,
+                handler_started_at=handler_started_at,
+            )
+        req = _parse_chat_request_payload(payload)
         return await _serve_chat_completion_request(
             app.state.server,
             req,
+            authorization=authorization,
+            http_received_at=http_received_at,
+            handler_started_at=handler_started_at,
+        )
+
+    @app.post("/v2/chat/completions")
+    async def lightning_v2_chat_completions(
+        request_http: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        http_received_at = getattr(request_http.state, "nanovllm_received_at", time.perf_counter())
+        payload = await _load_json_body(request_http)
+        handler_started_at = time.perf_counter()
+        return await _serve_lightning_private_chat(
+            app.state.server,
+            payload,
+            authorization=authorization,
+            http_received_at=http_received_at,
+            handler_started_at=handler_started_at,
+        )
+
+    @app.post("/state/chat/completions")
+    async def lightning_state_chat_completions(
+        request_http: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        http_received_at = getattr(request_http.state, "nanovllm_received_at", time.perf_counter())
+        payload = await _load_json_body(request_http)
+        handler_started_at = time.perf_counter()
+        session_id = payload.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise OpenAIAPIError(400, "Missing session_id parameter.", param="session_id")
+        return await _serve_lightning_private_chat(
+            app.state.server,
+            payload,
+            authorization=authorization,
+            http_received_at=http_received_at,
+            handler_started_at=handler_started_at,
+            state_session_id=session_id,
+            force_single_prompt=True,
+        )
+
+    @app.post("/state/status")
+    async def lightning_state_status(
+        request_http: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        payload = await _load_json_body(request_http)
+        _require_private_api_key(app.state.server, authorization, payload)
+        sessions = _lightning_session_store(app.state.server)
+        with _lightning_session_lock(app.state.server):
+            session_ids = list(sessions.keys())
+        detailed_states = [
+            {
+                "session_id": session_id,
+                "cache_level": "In Memory",
+                "last_updated": "In Memory",
+                "timestamp": time.time(),
+            }
+            for session_id in session_ids
+        ]
+        return _json_response(
+            {
+                "status": "success",
+                "total_sessions": len(session_ids),
+                "l1_cache_count": len(session_ids),
+                "l2_cache_count": 0,
+                "database_count": 0,
+                "sessions": detailed_states,
+            }
+        )
+
+    @app.post("/state/delete")
+    async def lightning_state_delete(
+        request_http: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        payload = await _load_json_body(request_http)
+        _require_private_api_key(app.state.server, authorization, payload)
+        session_id = payload.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise OpenAIAPIError(400, "Missing session_id parameter.", param="session_id")
+        delete_prefix = bool(payload.get("delete_prefix", False))
+        sessions = _lightning_session_store(app.state.server)
+        deleted = False
+        with _lightning_session_lock(app.state.server):
+            if session_id in sessions:
+                del sessions[session_id]
+                deleted = True
+            if delete_prefix:
+                prefix = f"{session_id}:"
+                for key in list(sessions.keys()):
+                    if key.startswith(prefix):
+                        del sessions[key]
+                        deleted = True
+        if deleted or delete_prefix:
+            return _json_response({"status": "success", "message": f"Session {session_id} deleted successfully"})
+        return _json_response(
+            {"status": "not_found", "message": f"Session {session_id} not found in database"},
+            status_code=404,
+        )
+
+    @app.post("/translate/v1/batch-translate")
+    async def lightning_batch_translate(
+        request_http: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        http_received_at = getattr(request_http.state, "nanovllm_received_at", time.perf_counter())
+        payload = await _load_json_body(request_http)
+        handler_started_at = time.perf_counter()
+        return await _serve_lightning_translate(
+            app.state.server,
+            payload,
+            authorization=authorization,
+            http_received_at=http_received_at,
+            handler_started_at=handler_started_at,
+        )
+
+    @app.post("/FIM/v1/batch-FIM")
+    async def lightning_fim_completions(
+        request_http: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        http_received_at = getattr(request_http.state, "nanovllm_received_at", time.perf_counter())
+        payload = await _load_json_body(request_http)
+        prefixes = _lightning_string_list(payload, "prefix")
+        suffixes = _lightning_string_list(payload, "suffix")
+        prompts = [f"✿prefix✿✿suffix✿{suffix}✿middle✿{prefix}" for prefix, suffix in zip(prefixes, suffixes)]
+        handler_started_at = time.perf_counter()
+        return await _serve_lightning_private_chat(
+            app.state.server,
+            {**payload, "contents": prompts, "stop_tokens": payload.get("stop_tokens", [])},
+            authorization=authorization,
+            http_received_at=http_received_at,
+            handler_started_at=handler_started_at,
+            response_object="FIM.completion",
+        )
+
+    @app.post("/openai/v1/chat/completions")
+    async def lightning_openai_chat_completions(
+        request_http: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        http_received_at = getattr(request_http.state, "nanovllm_received_at", time.perf_counter())
+        payload = await _load_json_body(request_http)
+        handler_started_at = time.perf_counter()
+        return await _serve_lightning_openai_compat_chat(
+            app.state.server,
+            payload,
             authorization=authorization,
             http_received_at=http_received_at,
             handler_started_at=handler_started_at,
