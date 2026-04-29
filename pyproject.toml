@@ -12,8 +12,11 @@ readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10,<3.13"
 dependencies = [
+    "numpy>=2.2.6",
     "torch>=2.4.0",
-    "triton>=3.0.0",
+    "tqdm>=4.67.3",
+    "triton>=3.0.0; sys_platform != 'win32'",
+    "triton-windows>=3.0.0; sys_platform == 'win32'",
     "xxhash",
 ]
 
@@ -27,3 +30,52 @@ include = ["nanovllm*"]
 [tool.setuptools.package-data]
 "nanovllm.tokenizers" = ["*.txt"]
 "nanovllm" = ["eval_data/*.jsonl", "eval_data/mmlu_test_dataset/*"]
+
+[project.optional-dependencies]
+torch-cpu = ["torch>=2.8.0"]
+torch-cu130 = ["torch>=2.8.0"]
+torch-cu126 = ["torch>=2.8.0"]
+torch-rocm = ["torch==2.9.1+rocm6.4", "pytorch-triton-rocm"]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "torch-cpu" },
+        { extra = "torch-cu130" },
+        { extra = "torch-cu126" },
+        { extra = "torch-rocm" },
+    ],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "torch-cpu" },
+    { index = "pytorch-cu130", extra = "torch-cu130" },
+    { index = "pytorch-cu126", extra = "torch-cu126" },
+    { index = "pytorch-rocm", extra = "torch-rocm" },
+]
+pytorch-triton-rocm = { index = "pytorch-rocm" }
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm6.4"
+explicit = true
