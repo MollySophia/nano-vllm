@@ -2813,7 +2813,7 @@ def _prepare_chat_request(
     tokenizer = _state_tokenizer(state)
     prompt_text = _render_openai_chat_prompt(tokenizer, req.messages, mode=mode)
     prompt_token_ids = _state_encode_text(state, prompt_text)
-    print(f"```{prompt_text}```")
+    # print(f"```{prompt_text}```")
     return PreparedOpenAIRequest(
         prompt_text=prompt_text,
         sampling_params=sampling_params,
