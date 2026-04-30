@@ -113,6 +113,54 @@ class OpenAIAPIStreamingTest(unittest.TestCase):
         )
         self.assertEqual(events[-2]["choices"][0]["delta"], {})
 
+    def test_chat_stream_emits_reasoning_content_and_restored_content(self):
+        with patched_test_client(chat_text="<think>## plan\nstep 2</think>## answer\nline 2") as (client, _llm, _factory):
+            with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={
+                    "model": "rwkv-test",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 64,
+                    "stream": True,
+                },
+            ) as response:
+                payloads = _read_sse_payloads(response)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payloads[-1], "[DONE]")
+        events = [json.loads(payload) for payload in payloads[:-1]]
+        deltas = [event["choices"][0]["delta"] for event in events if event.get("choices")]
+        reasoning = "".join(delta.get("reasoning_content", "") for delta in deltas)
+        content = "".join(delta.get("content", "") for delta in deltas)
+
+        self.assertEqual(reasoning, "## plan\n\nstep 2")
+        self.assertEqual(content, "## answer\n\nline 2")
+
+    def test_chat_stream_thinking_suffix_starts_parser_in_reasoning_mode(self):
+        with patched_test_client(chat_text="## plan\nstep 2</think>## answer\nline 2") as (client, _llm, _factory):
+            with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={
+                    "model": "rwkv-test:thinking",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 64,
+                    "stream": True,
+                },
+            ) as response:
+                payloads = _read_sse_payloads(response)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payloads[-1], "[DONE]")
+        events = [json.loads(payload) for payload in payloads[:-1]]
+        deltas = [event["choices"][0]["delta"] for event in events if event.get("choices")]
+        reasoning = "".join(delta.get("reasoning_content", "") for delta in deltas)
+        content = "".join(delta.get("content", "") for delta in deltas)
+
+        self.assertEqual(reasoning, "## plan\n\nstep 2")
+        self.assertEqual(content, "## answer\n\nline 2")
+
     def test_completion_stream_can_emit_usage_chunk_when_requested(self):
         with patched_test_client(completion_text="HEY") as (client, _llm, _factory):
             with client.stream(
