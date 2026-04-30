@@ -12,11 +12,17 @@ readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10,<3.13"
 dependencies = [
+    "aiohttp>=3.13.5",
+    "fastapi[standard]>=0.136.1",
+    "httpx>=0.28.1",
+    "msgspec>=0.21.1",
+    "ninja>=1.11.1; sys_platform == 'linux'",
     "numpy>=2.2.6",
     "torch>=2.4.0",
     "tqdm>=4.67.3",
     "triton>=3.0.0; sys_platform != 'win32'",
     "triton-windows>=3.0.0; sys_platform == 'win32'",
+    "uvicorn[standard]>=0.46.0",
     "xxhash",
 ]
 
@@ -46,6 +52,7 @@ conflicts = [
         { extra = "torch-rocm" },
     ],
 ]
+python-preference = "only-managed"
 
 [tool.uv.sources]
 torch = [
