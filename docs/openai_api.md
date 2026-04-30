@@ -73,10 +73,15 @@ The server currently returns `400` for unsupported behavior instead of silently 
 
 ## Prompt Rendering
 
-- RWKV chat requests now use a native `apply_chat_template()` modeled on `rwkv-mobile` defaults:
-  `System:` / `User:` / `Assistant:` role labels, `\n\n` turn separators, and an `Assistant:` generation prompt after a trailing user turn.
+- RWKV chat requests now use a native `apply_chat_template()` modeled on `rwkv-mobile` defaults to build the base transcript.
+- OpenAI chat requests then append the assistant generation tail based on the request `model` suffix:
+  `model=base-model` uses `Assistant: <think>\n</think>\n`
+  `model=base-model:thinking` uses `Assistant: <think`
+  `model=base-model:raw` uses `Assistant:`
 - Other tokenizer-backed chat models with `apply_chat_template` use the tokenizer's native template.
-- Tokenizers without any chat template still fall back to a simple plain-text transcript ending with `Assistant:`.
+- Tokenizers without any chat template still fall back to a simple plain-text transcript before the same suffix rules are applied.
+- `GET /v1/models` exposes three ids for the served model: the base model id, `:thinking`, and `:raw`.
+- Chat and completion responses echo the request `model` field, including `:thinking` or `:raw` when provided.
 
 ## Performance Metadata
 
@@ -144,7 +149,7 @@ Chat completion:
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "rwkv7-1p5b",
+    "model": "rwkv7-1p5b:thinking",
     "messages": [
       {"role": "user", "content": "请用中文简单解释什么是线性注意力。"}
     ],
@@ -152,6 +157,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
     "temperature": 0
   }'
 ```
+
+To disable `<think>` scaffolding for OpenAI chat prompt rendering, use `model=rwkv7-1p5b:raw`.
 
 Show response headers:
 

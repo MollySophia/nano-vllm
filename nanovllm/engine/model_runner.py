@@ -205,7 +205,8 @@ class ModelRunner:
         else:
             assert dtype == torch.float16
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        if self.world_size > 1:
+            dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.allow_tf32 = True

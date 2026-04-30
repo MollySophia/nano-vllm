@@ -15,7 +15,7 @@ import uuid
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import httpx
 import msgspec
@@ -24,10 +24,13 @@ import uvicorn
 from aiohttp import web
 from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from nanovllm import LLM, SamplingParams
+from nanovllm.entrypoints.openai.streaming_markdown_restorer import StreamingMarkdownRestorer
+from nanovllm.entrypoints.openai.streaming_string_parser import StreamingStringParser, TRIE_THINK_NO_TRIGGER
 from nanovllm.tokenizers import RWKVTokenizer, get_rwkv_tokenizer
 from nanovllm.utils.rwkv_int8 import (
     add_rwkv_int8_cli_args,
@@ -37,6 +40,69 @@ try:
     import uvloop
 except ModuleNotFoundError:  # pragma: no cover
     uvloop = None
+
+
+def _format_public_ready_urls(host: str | None, port: int | None) -> list[str]:
+    display_host = host or "127.0.0.1"
+    display_port = int(port or 8000)
+    host_variants = [display_host]
+    if display_host == "0.0.0.0":
+        host_variants = ["127.0.0.1", "0.0.0.0"]
+    elif display_host == "::":
+        host_variants = ["[::1]", "[::]"]
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for variant in host_variants:
+        if ":" in variant and not variant.startswith("["):
+            variant = f"[{variant}]"
+        url = f"http://{variant}:{display_port}/v1"
+        if url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+    return urls
+
+
+def _print_public_ready_banner(host: str | None, port: int | None) -> None:
+    urls = _format_public_ready_urls(host, port)
+    print("[nano-vllm] backend warmup complete; OpenAI API ready:", flush=True)
+    for url in urls:
+        print(f"[nano-vllm] {url}", flush=True)
+
+
+def _make_once_callback(callback: Callable[[], None]) -> Callable[[], None]:
+    fired = False
+    lock = threading.Lock()
+
+    def _wrapped() -> None:
+        nonlocal fired
+        with lock:
+            if fired:
+                return
+            fired = True
+        callback()
+
+    return _wrapped
+
+
+def _set_ready_event(ready_event: Any | None) -> None:
+    if ready_event is not None:
+        ready_event.set()
+
+
+class _ReadyAwareUvicornServer(uvicorn.Server):
+    def __init__(self, config: uvicorn.Config, ready_callback: Callable[[], None] | None = None):
+        super().__init__(config)
+        self._ready_callback = ready_callback
+        self._ready_callback_fired = False
+
+    async def startup(self, sockets: list[socket.socket] | None = None) -> None:
+        await super().startup(sockets)
+        if self._ready_callback is None or self._ready_callback_fired or self.should_exit:
+            return
+        self._ready_callback_fired = True
+        self._ready_callback()
 
 
 def _default_model_name(model_path: str) -> str:
@@ -312,6 +378,127 @@ class RequestResult:
     finish_reason: str
     ttft_s: float | None
     generation_s: float
+
+
+@dataclass(slots=True)
+class _ChatOutputFilter:
+    parser: StreamingStringParser = field(default_factory=lambda: StreamingStringParser(tries=TRIE_THINK_NO_TRIGGER))
+    content_restorer: StreamingMarkdownRestorer = field(default_factory=StreamingMarkdownRestorer)
+    reasoning_restorer: StreamingMarkdownRestorer = field(default_factory=StreamingMarkdownRestorer)
+
+
+def _assistant_message_payload(content: str, reasoning_content: str | None = None) -> dict[str, Any]:
+    message: dict[str, Any] = {"role": "assistant", "content": content}
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content
+    return message
+
+
+def _chat_stream_delta_payload(
+    *,
+    role: str | None = None,
+    content: str | None = None,
+    reasoning_content: str | None = None,
+) -> dict[str, Any]:
+    delta: dict[str, Any] = {}
+    if role is not None:
+        delta["role"] = role
+    if content is not None:
+        delta["content"] = content
+    if reasoning_content is not None:
+        delta["reasoning_content"] = reasoning_content
+    return delta
+
+
+def _filter_chat_segments(
+    filter_state: _ChatOutputFilter,
+    segments: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    events: list[tuple[str, str]] = []
+    for text, state in segments:
+        if not text:
+            continue
+        if state == "reasoning_content":
+            rendered = filter_state.reasoning_restorer.parse(text)
+            if rendered:
+                events.append(("reasoning_content", rendered))
+            continue
+        if state == "content":
+            rendered = filter_state.content_restorer.parse(text)
+            if rendered:
+                events.append(("content", rendered))
+    return events
+
+
+def _filter_chat_delta(filter_state: _ChatOutputFilter, delta: str) -> list[tuple[str, str]]:
+    if not delta:
+        return []
+    return _filter_chat_segments(filter_state, filter_state.parser.parse(delta))
+
+
+def _flush_chat_delta_filter(filter_state: _ChatOutputFilter) -> list[tuple[str, str]]:
+    events = _filter_chat_segments(filter_state, filter_state.parser.flush())
+    reasoning_tail = filter_state.reasoning_restorer.flush()
+    if reasoning_tail:
+        events.append(("reasoning_content", reasoning_tail))
+    content_tail = filter_state.content_restorer.flush()
+    if content_tail:
+        events.append(("content", content_tail))
+    return events
+
+
+def _filter_chat_text(text: str, *, mode: Literal["default", "thinking", "raw"] = "default") -> tuple[str, str | None]:
+    filter_state = _make_chat_output_filter(mode)
+    reasoning_parts: list[str] = []
+    content_parts: list[str] = []
+    for kind, rendered in _filter_chat_delta(filter_state, text):
+        if kind == "reasoning_content":
+            reasoning_parts.append(rendered)
+        else:
+            content_parts.append(rendered)
+    for kind, rendered in _flush_chat_delta_filter(filter_state):
+        if kind == "reasoning_content":
+            reasoning_parts.append(rendered)
+        else:
+            content_parts.append(rendered)
+    reasoning_text = "".join(reasoning_parts)
+    return "".join(content_parts), reasoning_text or None
+
+TRIE_RAW_NO_TRIGGER = StreamingStringParser.build_trie(
+    [
+        ("content", "\n\n", "end", "right"),
+    ]
+)
+
+def _chat_output_mode_from_prompt(prompt_text: str | None) -> Literal["default", "thinking", "raw"]:
+    normalized = (prompt_text or "").rstrip()
+    if normalized.endswith("Assistant: <think"):
+        return "thinking"
+    if normalized.endswith("Assistant:"):
+        return "raw"
+    return "default"
+
+def _make_chat_output_filter(mode: Literal["default", "thinking", "raw"] = "default") -> _ChatOutputFilter:
+    if mode == "thinking":
+        parser = StreamingStringParser(tries=TRIE_THINK_NO_TRIGGER, start_state="reasoning_content")
+    elif mode == "raw":
+        parser = StreamingStringParser(tries=TRIE_RAW_NO_TRIGGER)
+    else:
+        parser = StreamingStringParser(tries=TRIE_THINK_NO_TRIGGER)
+    return _ChatOutputFilter(parser=parser)
+
+
+def _apply_disable_cors(app: FastAPI, disable_cors: bool) -> None:
+    if not disable_cors:
+        return
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+    )
 
 
 @dataclass
@@ -1519,7 +1706,7 @@ def _coerce_text_content(content: str | list[TextPart] | None) -> str:
     return "".join(chunks)
 
 
-def _render_chat_prompt(tokenizer, messages: list[ChatMessage]) -> str:
+def _render_chat_prompt(tokenizer, messages: list[ChatMessage], *, add_generation_prompt: bool = True) -> str:
     normalized_messages = []
     for msg in messages:
         role_value = msg.role if isinstance(msg, ChatMessage) else msg.get("role")
@@ -1537,7 +1724,7 @@ def _render_chat_prompt(tokenizer, messages: list[ChatMessage]) -> str:
             return tokenizer.apply_chat_template(
                 normalized_messages,
                 tokenize=False,
-                add_generation_prompt=True,
+                add_generation_prompt=add_generation_prompt,
             )
         except Exception:
             pass
@@ -1556,9 +1743,77 @@ def _render_chat_prompt(tokenizer, messages: list[ChatMessage]) -> str:
                 msg["content"],
             )
         )
-    if not normalized_messages or normalized_messages[-1]["role"] != "assistant":
+    if add_generation_prompt and (not normalized_messages or normalized_messages[-1]["role"] != "assistant"):
         lines.append(RWKVTokenizer.format_role_line("Assistant"))
     return "\n".join(lines)
+
+
+def _parse_openai_model_mode(request_model: str) -> tuple[str, Literal["default", "thinking", "raw"]]:
+    base_model, sep, suffix = request_model.partition(":")
+    if not sep:
+        return request_model, "default"
+    suffix_lower = suffix.lower()
+    if "raw" in suffix_lower:
+        return base_model, "raw"
+    if "thinking" in suffix_lower:
+        return base_model, "thinking"
+    return base_model, "default"
+
+
+def _validate_openai_request_model(
+    request_model: str,
+    state: Any,
+) -> tuple[str, Literal["default", "thinking", "raw"]]:
+    base_model, mode = _parse_openai_model_mode(request_model)
+    _validate_model(base_model, state)
+    return base_model, mode
+
+
+def _openai_model_ids(model_id: str) -> list[str]:
+    return [model_id, f"{model_id}:thinking", f"{model_id}:raw"]
+
+
+def _openai_model_card(model_id: str, created: int) -> dict[str, Any]:
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": created,
+        "owned_by": "nano-vllm",
+    }
+
+
+def _openai_models_response(state: Any) -> dict[str, Any]:
+    return {
+        "object": "list",
+        "data": [_openai_model_card(model_id, state.created) for model_id in _openai_model_ids(state.model_id)],
+    }
+
+
+def _retrieve_openai_model_response(state: Any, request_model: str) -> dict[str, Any]:
+    if request_model not in _openai_model_ids(state.model_id):
+        raise OpenAIAPIError(
+            404,
+            f"Model {request_model!r} not found. This server is serving {state.model_id!r}.",
+            error_type="invalid_request_error",
+            param="model",
+            code="model_not_found",
+        )
+    return _openai_model_card(request_model, state.created)
+
+
+def _render_openai_chat_prompt(
+    tokenizer,
+    messages: list[ChatMessage],
+    *,
+    mode: Literal["default", "thinking", "raw"],
+) -> str:
+    prompt_text = _render_chat_prompt(tokenizer, messages, add_generation_prompt=False).strip()
+    prefix = f"{prompt_text}\n\n" if prompt_text else ""
+    if mode == "raw":
+        return f"{prefix}Assistant:"
+    if mode == "thinking":
+        return f"{prefix}Assistant: <think"
+    return f"{prefix}Assistant: <think>\n</think>\n"
 
 
 def _validate_model(request_model: str, state: ServerState):
@@ -2532,7 +2787,7 @@ def _prepare_completion_request(
     state: Any,
     req: CompletionRequest | ParsedCompletionRequest,
 ) -> PreparedOpenAIRequest:
-    _validate_model(req.model, state)
+    _validate_openai_request_model(req.model, state)
     sampling_params = _sampling_params_from_completion(req)
     prompt_text, prompt_token_ids = _resolve_completion_prompt(req.prompt, req.prompt_token_ids)
     if prompt_token_ids is None and prompt_text is not None:
@@ -2553,11 +2808,12 @@ def _prepare_chat_request(
     state: Any,
     req: ChatCompletionRequest | ParsedChatCompletionRequest,
 ) -> PreparedOpenAIRequest:
-    _validate_model(req.model, state)
+    _base_model, mode = _validate_openai_request_model(req.model, state)
     sampling_params = _sampling_params_from_chat(req)
     tokenizer = _state_tokenizer(state)
-    prompt_text = _render_chat_prompt(tokenizer, req.messages)
+    prompt_text = _render_openai_chat_prompt(tokenizer, req.messages, mode=mode)
     prompt_token_ids = _state_encode_text(state, prompt_text)
+    print(f"```{prompt_text}```")
     return PreparedOpenAIRequest(
         prompt_text=prompt_text,
         sampling_params=sampling_params,
@@ -2575,6 +2831,7 @@ async def _serve_completion_request(
     handler_started_at: float,
 ) -> Response:
     _require_api_key(state, authorization)
+    response_model = req.model
     prepared = _prepare_completion_request(state, req)
     stream_include_usage = _stream_options_include_usage(req.stream_options)
     created = int(time.time())
@@ -2624,7 +2881,7 @@ async def _serve_completion_request(
                                 "id": completion_id,
                                 "object": "text_completion",
                                 "created": created,
-                                "model": state.model_id,
+                                "model": response_model,
                                 "choices": [
                                     {
                                         "index": 0,
@@ -2642,7 +2899,7 @@ async def _serve_completion_request(
                                 "id": completion_id,
                                 "object": "text_completion",
                                 "created": created,
-                                "model": state.model_id,
+                                "model": response_model,
                                 "choices": [
                                     {
                                         "index": 0,
@@ -2663,7 +2920,7 @@ async def _serve_completion_request(
                                 _completion_stream_usage_event(
                                     completion_id=completion_id,
                                     created=created,
-                                    model=state.model_id,
+                                    model=response_model,
                                     prompt_token_count=len(request.prompt_token_ids),
                                     completion_token_count=len(request.completion_token_ids),
                                 )
@@ -2709,7 +2966,7 @@ async def _serve_completion_request(
             "id": completion_id,
             "object": "text_completion",
             "created": created,
-            "model": state.model_id,
+            "model": response_model,
             "choices": [
                 {
                     "index": 0,
@@ -2736,6 +2993,7 @@ async def _serve_chat_completion_request(
     handler_started_at: float,
 ) -> Response:
     _require_api_key(state, authorization)
+    response_model = req.model
     prepared = _prepare_chat_request(state, req)
     stream_include_usage = _stream_options_include_usage(req.stream_options)
     created = int(time.time())
@@ -2750,6 +3008,7 @@ async def _serve_chat_completion_request(
         handler_started_at=handler_started_at,
         stream=bool(req.stream),
     )
+    prompt_mode = _chat_output_mode_from_prompt(request.prompt_text)
     if req.stream:
         assert request.ready_event is not None
         try:
@@ -2775,17 +3034,19 @@ async def _serve_chat_completion_request(
 
         async def event_stream():
             completed = False
+            filter_state = _make_chat_output_filter(prompt_mode)
+            flushed = False
             try:
                 yield _sse_payload(
                     {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created,
-                        "model": state.model_id,
+                        "model": response_model,
                         "choices": [
                             {
                                 "index": 0,
-                                "delta": {"role": "assistant", "content": ""},
+                                "delta": _chat_stream_delta_payload(role="assistant", content=""),
                                 "finish_reason": None,
                             }
                         ],
@@ -2795,29 +3056,54 @@ async def _serve_chat_completion_request(
                 while True:
                     kind, value = await request.stream_queue.get()
                     if kind == "delta":
-                        yield _sse_payload(
-                            {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": state.model_id,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {"content": value or ""},
-                                        "finish_reason": None,
-                                    }
-                                ],
-                            }
-                        )
+                        for output_kind, output_text in _filter_chat_delta(filter_state, value or ""):
+                            yield _sse_payload(
+                                {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": response_model,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": _chat_stream_delta_payload(
+                                                content=output_text if output_kind == "content" else None,
+                                                reasoning_content=output_text if output_kind == "reasoning_content" else None,
+                                            ),
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                            )
                         continue
                     if kind == "finish":
+                        if not flushed:
+                            for output_kind, output_text in _flush_chat_delta_filter(filter_state):
+                                yield _sse_payload(
+                                    {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": response_model,
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": _chat_stream_delta_payload(
+                                                    content=output_text if output_kind == "content" else None,
+                                                    reasoning_content=output_text if output_kind == "reasoning_content" else None,
+                                                ),
+                                                "finish_reason": None,
+                                            }
+                                        ],
+                                    }
+                                )
+                            flushed = True
                         yield _sse_payload(
                             {
                                 "id": completion_id,
                                 "object": "chat.completion.chunk",
                                 "created": created,
-                                "model": state.model_id,
+                                "model": response_model,
                                 "choices": [
                                     {
                                         "index": 0,
@@ -2834,12 +3120,33 @@ async def _serve_chat_completion_request(
                         completed = True
                         _raise_request_error(request)
                     if kind == "done":
+                        if not flushed:
+                            for output_kind, output_text in _flush_chat_delta_filter(filter_state):
+                                yield _sse_payload(
+                                    {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": response_model,
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": _chat_stream_delta_payload(
+                                                    content=output_text if output_kind == "content" else None,
+                                                    reasoning_content=output_text if output_kind == "reasoning_content" else None,
+                                                ),
+                                                "finish_reason": None,
+                                            }
+                                        ],
+                                    }
+                                )
+                            flushed = True
                         if stream_include_usage:
                             yield _sse_payload(
                                 _chat_stream_usage_event(
                                     completion_id=completion_id,
                                     created=created,
-                                    model=state.model_id,
+                                    model=response_model,
                                     prompt_token_count=len(request.prompt_token_ids),
                                     completion_token_count=len(request.completion_token_ids),
                                 )
@@ -2861,6 +3168,7 @@ async def _serve_chat_completion_request(
     await request.done_event.wait()
     _raise_request_error(request)
     result = request.result()
+    content_text, reasoning_text = _filter_chat_text(result.text, mode=prompt_mode)
     total_s = 0.0 if request.total_s is None else request.total_s
     request.response_built_at = time.perf_counter()
     headers = _response_headers(
@@ -2883,14 +3191,11 @@ async def _serve_chat_completion_request(
             "id": completion_id,
             "object": "chat.completion",
             "created": created,
-            "model": state.model_id,
+            "model": response_model,
             "choices": [
                 {
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": result.text,
-                    },
+                    "message": _assistant_message_payload(content_text, reasoning_text),
                     "finish_reason": result.finish_reason,
                 }
             ],
@@ -3015,10 +3320,15 @@ def _lightning_prepared_requests(
     return prepared_requests
 
 
-def _lightning_response_choice(index: int, text: str, finish_reason: str) -> dict[str, Any]:
+def _lightning_response_choice(
+    index: int,
+    text: str,
+    finish_reason: str,
+    reasoning_text: str | None = None,
+) -> dict[str, Any]:
     return {
         "index": index,
-        "message": {"role": "assistant", "content": text},
+        "message": _assistant_message_payload(text, reasoning_text),
         "finish_reason": finish_reason,
     }
 
@@ -3113,8 +3423,10 @@ async def _serve_lightning_private_chat(
         for index, request in enumerate(requests):
             _raise_request_error(request)
             result = request.result()
-            completion_texts.append(result.text)
-            choices.append(_lightning_response_choice(index, result.text, result.finish_reason))
+            prompt_mode = _chat_output_mode_from_prompt(request.prompt_text)
+            content_text, reasoning_text = _filter_chat_text(result.text, mode=prompt_mode)
+            completion_texts.append(content_text)
+            choices.append(_lightning_response_choice(index, content_text, result.finish_reason, reasoning_text))
         if session_prompt is not None and completion_texts:
             _lightning_update_session(state, session_id, session_prompt, completion_texts[0])
         return _json_response(
@@ -3133,6 +3445,8 @@ async def _serve_lightning_private_chat(
     async def event_stream():
         tasks: dict[asyncio.Task, int] = {}
         completion_buffers = [""] * len(requests)
+        filter_states = [_make_chat_output_filter(_chat_output_mode_from_prompt(request.prompt_text)) for request in requests]
+        flushed: set[int] = set()
         completed = set()
         try:
             for index, request in enumerate(requests):
@@ -3145,24 +3459,71 @@ async def _serve_lightning_private_chat(
                     request = requests[index]
                     kind, value = task.result()
                     if kind == "delta":
-                        text = value or ""
-                        completion_buffers[index] += text
-                        yield _sse_payload(
-                            {
-                                "object": "chat.completion.chunk",
-                                "choices": [{"index": index, "delta": {"content": text}}],
-                            }
-                        )
+                        for output_kind, output_text in _filter_chat_delta(filter_states[index], value or ""):
+                            if output_kind == "content":
+                                completion_buffers[index] += output_text
+                            yield _sse_payload(
+                                {
+                                    "object": "chat.completion.chunk",
+                                    "choices": [
+                                        {
+                                            "index": index,
+                                            "delta": _chat_stream_delta_payload(
+                                                content=output_text if output_kind == "content" else None,
+                                                reasoning_content=output_text if output_kind == "reasoning_content" else None,
+                                            ),
+                                        }
+                                    ],
+                                }
+                            )
                         assert request.stream_queue is not None
                         tasks[asyncio.create_task(request.stream_queue.get())] = index
                         continue
                     if kind == "finish":
+                        if index not in flushed:
+                            for output_kind, output_text in _flush_chat_delta_filter(filter_states[index]):
+                                if output_kind == "content":
+                                    completion_buffers[index] += output_text
+                                yield _sse_payload(
+                                    {
+                                        "object": "chat.completion.chunk",
+                                        "choices": [
+                                            {
+                                                "index": index,
+                                                "delta": _chat_stream_delta_payload(
+                                                    content=output_text if output_kind == "content" else None,
+                                                    reasoning_content=output_text if output_kind == "reasoning_content" else None,
+                                                ),
+                                            }
+                                        ],
+                                    }
+                                )
+                            flushed.add(index)
                         assert request.stream_queue is not None
                         tasks[asyncio.create_task(request.stream_queue.get())] = index
                         continue
                     if kind == "error":
                         _raise_request_error(request)
                     if kind == "done":
+                        if index not in flushed:
+                            for output_kind, output_text in _flush_chat_delta_filter(filter_states[index]):
+                                if output_kind == "content":
+                                    completion_buffers[index] += output_text
+                                yield _sse_payload(
+                                    {
+                                        "object": "chat.completion.chunk",
+                                        "choices": [
+                                            {
+                                                "index": index,
+                                                "delta": _chat_stream_delta_payload(
+                                                    content=output_text if output_kind == "content" else None,
+                                                    reasoning_content=output_text if output_kind == "reasoning_content" else None,
+                                                ),
+                                            }
+                                        ],
+                                    }
+                                )
+                            flushed.add(index)
                         completed.add(index)
             if session_prompt is not None and completion_buffers:
                 _lightning_update_session(state, session_id, session_prompt, completion_buffers[0])
@@ -3308,6 +3669,7 @@ async def _serve_lightning_openai_compat_chat(
         handler_started_at=handler_started_at,
         stream=stream,
     )
+    prompt_mode = _chat_output_mode_from_prompt(request.prompt_text)
     if stream:
         assert request.ready_event is not None
         await request.ready_event.wait()
@@ -3315,6 +3677,8 @@ async def _serve_lightning_openai_compat_chat(
 
         async def event_stream():
             completed = False
+            filter_state = _make_chat_output_filter(prompt_mode)
+            flushed = False
             try:
                 yield _sse_payload(
                     {
@@ -3322,24 +3686,61 @@ async def _serve_lightning_openai_compat_chat(
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model_name,
-                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": _chat_stream_delta_payload(role="assistant"),
+                                "finish_reason": None,
+                            }
+                        ],
                     }
                 )
                 assert request.stream_queue is not None
                 while True:
                     kind, value = await request.stream_queue.get()
                     if kind == "delta":
-                        yield _sse_payload(
-                            {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_name,
-                                "choices": [{"index": 0, "delta": {"content": value or ""}, "finish_reason": None}],
-                            }
-                        )
+                        for output_kind, output_text in _filter_chat_delta(filter_state, value or ""):
+                            yield _sse_payload(
+                                {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_name,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": _chat_stream_delta_payload(
+                                                content=output_text if output_kind == "content" else None,
+                                                reasoning_content=output_text if output_kind == "reasoning_content" else None,
+                                            ),
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                            )
                         continue
                     if kind == "finish":
+                        if not flushed:
+                            for output_kind, output_text in _flush_chat_delta_filter(filter_state):
+                                yield _sse_payload(
+                                    {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model_name,
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": _chat_stream_delta_payload(
+                                                    content=output_text if output_kind == "content" else None,
+                                                    reasoning_content=output_text if output_kind == "reasoning_content" else None,
+                                                ),
+                                                "finish_reason": None,
+                                            }
+                                        ],
+                                    }
+                                )
+                            flushed = True
                         yield _sse_payload(
                             {
                                 "id": completion_id,
@@ -3354,6 +3755,27 @@ async def _serve_lightning_openai_compat_chat(
                         completed = True
                         _raise_request_error(request)
                     if kind == "done":
+                        if not flushed:
+                            for output_kind, output_text in _flush_chat_delta_filter(filter_state):
+                                yield _sse_payload(
+                                    {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model_name,
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": _chat_stream_delta_payload(
+                                                    content=output_text if output_kind == "content" else None,
+                                                    reasoning_content=output_text if output_kind == "reasoning_content" else None,
+                                                ),
+                                                "finish_reason": None,
+                                            }
+                                        ],
+                                    }
+                                )
+                            flushed = True
                         completed = True
                         yield _sse_payload("[DONE]")
                         return
@@ -3367,6 +3789,7 @@ async def _serve_lightning_openai_compat_chat(
     await request.done_event.wait()
     _raise_request_error(request)
     result = request.result()
+    content_text, reasoning_text = _filter_chat_text(result.text, mode=prompt_mode)
     return _json_response(
         {
             "id": completion_id,
@@ -3376,7 +3799,7 @@ async def _serve_lightning_openai_compat_chat(
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": result.text},
+                    "message": _assistant_message_payload(content_text, reasoning_text),
                     "finish_reason": result.finish_reason,
                 }
             ],
@@ -3450,6 +3873,7 @@ def create_app(
     llm_kwargs: dict[str, Any] | None = None,
     server_state: ServerState | None = None,
     manage_resources: bool = True,
+    disable_cors: bool = False,
 ) -> FastAPI:
     state = server_state or _create_server_state(
         model=model,
@@ -3473,6 +3897,7 @@ def create_app(
         yield
 
     app = FastAPI(title="nano-vllm OpenAI-compatible API", lifespan=lifespan)
+    _apply_disable_cors(app, disable_cors)
     app.state.server = state
 
     @app.middleware("http")
@@ -3497,24 +3922,12 @@ def create_app(
     @app.get("/v1/models")
     async def list_models(authorization: str | None = Header(default=None)):
         _require_api_key(app.state.server, authorization)
-        model_info = {
-            "id": app.state.server.model_id,
-            "object": "model",
-            "created": app.state.server.created,
-            "owned_by": "nano-vllm",
-        }
-        return {"object": "list", "data": [model_info]}
+        return _openai_models_response(app.state.server)
 
     @app.get("/v1/models/{model_id}")
     async def retrieve_model(model_id: str, authorization: str | None = Header(default=None)):
         _require_api_key(app.state.server, authorization)
-        _validate_model(model_id, app.state.server)
-        return {
-            "id": app.state.server.model_id,
-            "object": "model",
-            "created": app.state.server.created,
-            "owned_by": "nano-vllm",
-        }
+        return _retrieve_openai_model_response(app.state.server, model_id)
 
     @app.post("/v1/completions")
     async def completions(
@@ -3888,7 +4301,15 @@ async def _ipc_backend_handle_connection(
                 else:
                     sampling_params = _sampling_params_from_payload(frame["sampling"])
                     if endpoint == "chat":
-                        prompt_text = _render_chat_prompt(state.llm.tokenizer, frame["messages"])
+                        _base_model, mode = _validate_openai_request_model(
+                            str(frame.get("model", state.model_id)),
+                            state,
+                        )
+                        prompt_text = _render_openai_chat_prompt(
+                            state.llm.tokenizer,
+                            frame["messages"],
+                            mode=mode,
+                        )
                         prepared = PreparedOpenAIRequest(
                             prompt_text=prompt_text,
                             sampling_params=sampling_params,
@@ -4073,6 +4494,8 @@ def _run_ipc_frontend_process(
     access_log: bool,
     backlog: int,
     timeout_keep_alive: int,
+    disable_cors: bool,
+    frontend_ready_event: Any | None = None,
 ):
     app = create_ipc_frontend_app(
         model_id=model_id,
@@ -4080,6 +4503,7 @@ def _run_ipc_frontend_process(
         api_key=api_key,
         backend_uds=backend_uds,
         backend_channel_count=backend_channel_count,
+        disable_cors=disable_cors,
     )
     _run_uvicorn_server(
         app,
@@ -4091,6 +4515,7 @@ def _run_ipc_frontend_process(
         backlog=backlog,
         timeout_keep_alive=timeout_keep_alive,
         sockets=[public_socket],
+        ready_callback=(lambda: _set_ready_event(frontend_ready_event)) if frontend_ready_event is not None else None,
     )
 
 
@@ -4101,6 +4526,7 @@ def create_ipc_frontend_app(
     api_key: str | None,
     backend_uds: str,
     backend_channel_count: int,
+    disable_cors: bool = False,
 ) -> FastAPI:
     state = IPCFrontendState(
         model_id=model_id,
@@ -4138,6 +4564,7 @@ def create_ipc_frontend_app(
                     pass
 
     app = FastAPI(title="nano-vllm OpenAI IPC frontend", lifespan=lifespan)
+    _apply_disable_cors(app, disable_cors)
     app.state.server = state
 
     async def _checkout_backend_channel() -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
@@ -4174,28 +4601,12 @@ def create_ipc_frontend_app(
     @app.get("/v1/models")
     async def list_models(authorization: str | None = Header(default=None)):
         _require_api_key(app.state.server, authorization)
-        return {
-            "object": "list",
-            "data": [
-                {
-                    "id": app.state.server.model_id,
-                    "object": "model",
-                    "created": app.state.server.created,
-                    "owned_by": "nano-vllm",
-                }
-            ],
-        }
+        return _openai_models_response(app.state.server)
 
     @app.get("/v1/models/{model_id}")
     async def retrieve_model(model_id: str, authorization: str | None = Header(default=None)):
         _require_api_key(app.state.server, authorization)
-        _validate_model(model_id, app.state.server)
-        return {
-            "id": app.state.server.model_id,
-            "object": "model",
-            "created": app.state.server.created,
-            "owned_by": "nano-vllm",
-        }
+        return _retrieve_openai_model_response(app.state.server, model_id)
 
     @app.post("/v1/completions")
     async def completions(request_http: Request, authorization: str | None = Header(default=None)):
@@ -4395,6 +4806,8 @@ def create_ipc_frontend_app(
                 )
 
                 async def event_stream():
+                    filter_state = _ChatOutputFilter()
+                    flushed = False
                     try:
                         yield _sse_payload(
                             {
@@ -4405,7 +4818,7 @@ def create_ipc_frontend_app(
                                 "choices": [
                                     {
                                         "index": 0,
-                                        "delta": {"role": "assistant", "content": ""},
+                                        "delta": _chat_stream_delta_payload(role="assistant", content=""),
                                         "finish_reason": None,
                                     }
                                 ],
@@ -4417,23 +4830,48 @@ def create_ipc_frontend_app(
                                 return
                             kind = frame.get("kind")
                             if kind == "delta":
-                                yield _sse_payload(
-                                    {
-                                        "id": completion_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created_at,
-                                        "model": app.state.server.model_id,
-                                        "choices": [
-                                            {
-                                                "index": 0,
-                                                "delta": {"content": frame.get("text") or ""},
-                                                "finish_reason": None,
-                                            }
-                                        ],
-                                    }
-                                )
+                                for output_kind, output_text in _filter_chat_delta(filter_state, frame.get("text") or ""):
+                                    yield _sse_payload(
+                                        {
+                                            "id": completion_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created_at,
+                                            "model": app.state.server.model_id,
+                                            "choices": [
+                                                {
+                                                    "index": 0,
+                                                    "delta": _chat_stream_delta_payload(
+                                                        content=output_text if output_kind == "content" else None,
+                                                        reasoning_content=output_text if output_kind == "reasoning_content" else None,
+                                                    ),
+                                                    "finish_reason": None,
+                                                }
+                                            ],
+                                        }
+                                    )
                                 continue
                             if kind == "done":
+                                if not flushed:
+                                    for output_kind, output_text in _flush_chat_delta_filter(filter_state):
+                                        yield _sse_payload(
+                                            {
+                                                "id": completion_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": created_at,
+                                                "model": app.state.server.model_id,
+                                                "choices": [
+                                                    {
+                                                        "index": 0,
+                                                        "delta": _chat_stream_delta_payload(
+                                                            content=output_text if output_kind == "content" else None,
+                                                            reasoning_content=output_text if output_kind == "reasoning_content" else None,
+                                                        ),
+                                                        "finish_reason": None,
+                                                    }
+                                                ],
+                                            }
+                                        )
+                                    flushed = True
                                 yield _sse_payload(
                                     {
                                         "id": completion_id,
@@ -4477,6 +4915,7 @@ def create_ipc_frontend_app(
             raise OpenAIAPIError(503, "Backend closed connection without a result.", error_type="server_error")
         if frame.get("kind") == "error":
             raise _deserialize_openai_error(frame["error"])
+        content_text, reasoning_text = _filter_chat_text(frame["text"])
         backend_finished_at = time.perf_counter()
         response_built_at = time.perf_counter()
         processing_s = backend_finished_at - submit_started_at
@@ -4504,7 +4943,7 @@ def create_ipc_frontend_app(
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": frame["text"]},
+                        "message": _assistant_message_payload(content_text, reasoning_text),
                         "finish_reason": frame["finish_reason"],
                     }
                 ],
@@ -4788,6 +5227,7 @@ def create_queue_frontend_app(
     frontend_id: int,
     request_queue: Any,
     response_queue: Any,
+    disable_cors: bool = False,
 ) -> FastAPI:
     state = QueueFrontendState(
         model_id=model_id,
@@ -4811,6 +5251,7 @@ def create_queue_frontend_app(
             bridge.stop()
 
     app = FastAPI(title="nano-vllm OpenAI queue frontend", lifespan=lifespan)
+    _apply_disable_cors(app, disable_cors)
     app.state.server = state
 
     @app.middleware("http")
@@ -4829,28 +5270,12 @@ def create_queue_frontend_app(
     @app.get("/v1/models")
     async def list_models(authorization: str | None = Header(default=None)):
         _require_api_key(app.state.server, authorization)
-        return {
-            "object": "list",
-            "data": [
-                {
-                    "id": app.state.server.model_id,
-                    "object": "model",
-                    "created": app.state.server.created,
-                    "owned_by": "nano-vllm",
-                }
-            ],
-        }
+        return _openai_models_response(app.state.server)
 
     @app.get("/v1/models/{model_id}")
     async def retrieve_model(model_id: str, authorization: str | None = Header(default=None)):
         _require_api_key(app.state.server, authorization)
-        _validate_model(model_id, app.state.server)
-        return {
-            "id": app.state.server.model_id,
-            "object": "model",
-            "created": app.state.server.created,
-            "owned_by": "nano-vllm",
-        }
+        return _retrieve_openai_model_response(app.state.server, model_id)
 
     @app.post("/v1/completions")
     async def completions(request_http: Request, authorization: str | None = Header(default=None)):
@@ -5037,6 +5462,8 @@ def create_queue_frontend_app(
                 )
 
                 async def event_stream():
+                    filter_state = _ChatOutputFilter()
+                    flushed = False
                     try:
                         yield _sse_payload(
                             {
@@ -5047,7 +5474,7 @@ def create_queue_frontend_app(
                                 "choices": [
                                     {
                                         "index": 0,
-                                        "delta": {"role": "assistant", "content": ""},
+                                        "delta": _chat_stream_delta_payload(role="assistant", content=""),
                                         "finish_reason": None,
                                     }
                                 ],
@@ -5057,23 +5484,48 @@ def create_queue_frontend_app(
                             frame = await frame_queue.get()
                             kind = frame.get("kind")
                             if kind == "delta":
-                                yield _sse_payload(
-                                    {
-                                        "id": completion_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created_at,
-                                        "model": app.state.server.model_id,
-                                        "choices": [
-                                            {
-                                                "index": 0,
-                                                "delta": {"content": frame.get("text") or ""},
-                                                "finish_reason": None,
-                                            }
-                                        ],
-                                    }
-                                )
+                                for output_kind, output_text in _filter_chat_delta(filter_state, frame.get("text") or ""):
+                                    yield _sse_payload(
+                                        {
+                                            "id": completion_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created_at,
+                                            "model": app.state.server.model_id,
+                                            "choices": [
+                                                {
+                                                    "index": 0,
+                                                    "delta": _chat_stream_delta_payload(
+                                                        content=output_text if output_kind == "content" else None,
+                                                        reasoning_content=output_text if output_kind == "reasoning_content" else None,
+                                                    ),
+                                                    "finish_reason": None,
+                                                }
+                                            ],
+                                        }
+                                    )
                                 continue
                             if kind == "done":
+                                if not flushed:
+                                    for output_kind, output_text in _flush_chat_delta_filter(filter_state):
+                                        yield _sse_payload(
+                                            {
+                                                "id": completion_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": created_at,
+                                                "model": app.state.server.model_id,
+                                                "choices": [
+                                                    {
+                                                        "index": 0,
+                                                        "delta": _chat_stream_delta_payload(
+                                                            content=output_text if output_kind == "content" else None,
+                                                            reasoning_content=output_text if output_kind == "reasoning_content" else None,
+                                                        ),
+                                                        "finish_reason": None,
+                                                    }
+                                                ],
+                                            }
+                                        )
+                                    flushed = True
                                 yield _sse_payload(
                                     {
                                         "id": completion_id,
@@ -5114,6 +5566,7 @@ def create_queue_frontend_app(
                 app.state.response_bridge.unregister(completion_id)
         if frame.get("kind") == "error":
             raise _deserialize_openai_error(frame["error"])
+        content_text, reasoning_text = _filter_chat_text(frame["text"])
         backend_finished_at = time.perf_counter()
         response_built_at = time.perf_counter()
         processing_s = backend_finished_at - submit_started_at
@@ -5141,7 +5594,7 @@ def create_queue_frontend_app(
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": frame["text"]},
+                        "message": _assistant_message_payload(content_text, reasoning_text),
                         "finish_reason": frame["finish_reason"],
                     }
                 ],
@@ -5238,37 +5691,18 @@ def create_queue_frontend_aiohttp_app(
 
     async def list_models(request: web.Request):
         _require_api_key(state, request.headers.get("Authorization"))
-        return _aiohttp_json_response(
-            {
-                "object": "list",
-                "data": [
-                    {
-                        "id": state.model_id,
-                        "object": "model",
-                        "created": state.created,
-                        "owned_by": "nano-vllm",
-                    }
-                ],
-            }
-        )
+        return _aiohttp_json_response(_openai_models_response(state))
 
     async def retrieve_model(request: web.Request):
         _require_api_key(state, request.headers.get("Authorization"))
-        _validate_model(request.match_info["model_id"], state)
-        return _aiohttp_json_response(
-            {
-                "id": state.model_id,
-                "object": "model",
-                "created": state.created,
-                "owned_by": "nano-vllm",
-            }
-        )
+        return _aiohttp_json_response(_retrieve_openai_model_response(state, request.match_info["model_id"]))
 
     async def completions(request: web.Request):
         http_received_at = request["nanovllm_received_at"]
         payload = _decode_json_body(await request.read())
         handler_started_at = time.perf_counter()
         _require_api_key(state, request.headers.get("Authorization"))
+        response_model = str(payload.get("model", state.model_id))
         stream = bool(_optional_bool(payload, "stream", False))
         stream_include_usage = _stream_options_include_usage(payload.get("stream_options"))
         created_at = int(time.time())
@@ -5321,7 +5755,7 @@ def create_queue_frontend_aiohttp_app(
                                         "id": completion_id,
                                         "object": "text_completion",
                                         "created": created_at,
-                                        "model": state.model_id,
+                                        "model": response_model,
                                         "choices": [
                                             {
                                                 "index": 0,
@@ -5341,7 +5775,7 @@ def create_queue_frontend_aiohttp_app(
                                         "id": completion_id,
                                         "object": "text_completion",
                                         "created": created_at,
-                                        "model": state.model_id,
+                                        "model": response_model,
                                         "choices": [
                                             {
                                                 "index": 0,
@@ -5359,7 +5793,7 @@ def create_queue_frontend_aiohttp_app(
                                         _completion_stream_usage_event(
                                             completion_id=completion_id,
                                             created=created_at,
-                                            model=state.model_id,
+                                            model=response_model,
                                             prompt_token_count=int(start_frame["prompt_token_count"]),
                                             completion_token_count=int(frame["completion_token_count"]),
                                         )
@@ -5402,7 +5836,7 @@ def create_queue_frontend_aiohttp_app(
                 "id": completion_id,
                 "object": "text_completion",
                 "created": created_at,
-                "model": state.model_id,
+                "model": response_model,
                 "choices": [
                     {
                         "index": 0,
@@ -5421,6 +5855,8 @@ def create_queue_frontend_aiohttp_app(
         payload = _decode_json_body(await request.read())
         handler_started_at = time.perf_counter()
         _require_api_key(state, request.headers.get("Authorization"))
+        response_model = str(payload.get("model", state.model_id))
+        _base_model, prompt_mode = _parse_openai_model_mode(response_model)
         stream = bool(_optional_bool(payload, "stream", False))
         stream_include_usage = _stream_options_include_usage(payload.get("stream_options"))
         created_at = int(time.time())
@@ -5460,17 +5896,19 @@ def create_queue_frontend_aiohttp_app(
                 response.content_type = "text/event-stream"
                 await response.prepare(request)
                 try:
+                    filter_state = _make_chat_output_filter(prompt_mode)
+                    flushed = False
                     await response.write(
                         _sse_payload(
                             {
                                 "id": completion_id,
                                 "object": "chat.completion.chunk",
                                 "created": created_at,
-                                "model": state.model_id,
+                                "model": response_model,
                                 "choices": [
                                     {
                                         "index": 0,
-                                        "delta": {"role": "assistant", "content": ""},
+                                        "delta": _chat_stream_delta_payload(role="assistant", content=""),
                                         "finish_reason": None,
                                     }
                                 ],
@@ -5481,32 +5919,59 @@ def create_queue_frontend_aiohttp_app(
                         frame = await frame_queue.get()
                         kind = frame.get("kind")
                         if kind == "delta":
-                            await response.write(
-                                _sse_payload(
-                                    {
-                                        "id": completion_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created_at,
-                                        "model": state.model_id,
-                                        "choices": [
-                                            {
-                                                "index": 0,
-                                                "delta": {"content": frame.get("text") or ""},
-                                                "finish_reason": None,
-                                            }
-                                        ],
-                                    }
+                            for output_kind, output_text in _filter_chat_delta(filter_state, frame.get("text") or ""):
+                                await response.write(
+                                    _sse_payload(
+                                        {
+                                            "id": completion_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created_at,
+                                            "model": response_model,
+                                            "choices": [
+                                                {
+                                                    "index": 0,
+                                                    "delta": _chat_stream_delta_payload(
+                                                        content=output_text if output_kind == "content" else None,
+                                                        reasoning_content=output_text if output_kind == "reasoning_content" else None,
+                                                    ),
+                                                    "finish_reason": None,
+                                                }
+                                            ],
+                                        }
+                                    )
                                 )
-                            )
                             continue
                         if kind == "done":
+                            if not flushed:
+                                for output_kind, output_text in _flush_chat_delta_filter(filter_state):
+                                    await response.write(
+                                        _sse_payload(
+                                            {
+                                                "id": completion_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": created_at,
+                                                "model": response_model,
+                                                "choices": [
+                                                    {
+                                                        "index": 0,
+                                                        "delta": _chat_stream_delta_payload(
+                                                            content=output_text if output_kind == "content" else None,
+                                                            reasoning_content=output_text if output_kind == "reasoning_content" else None,
+                                                        ),
+                                                        "finish_reason": None,
+                                                    }
+                                                ],
+                                            }
+                                        )
+                                    )
+                                flushed = True
                             await response.write(
                                 _sse_payload(
                                     {
                                         "id": completion_id,
                                         "object": "chat.completion.chunk",
                                         "created": created_at,
-                                        "model": state.model_id,
+                                        "model": response_model,
                                         "choices": [
                                             {
                                                 "index": 0,
@@ -5523,7 +5988,7 @@ def create_queue_frontend_aiohttp_app(
                                         _chat_stream_usage_event(
                                             completion_id=completion_id,
                                             created=created_at,
-                                            model=state.model_id,
+                                            model=response_model,
                                             prompt_token_count=int(start_frame["prompt_token_count"]),
                                             completion_token_count=int(frame["completion_token_count"]),
                                         )
@@ -5543,6 +6008,7 @@ def create_queue_frontend_aiohttp_app(
                 response_bridge.unregister(completion_id)
         if frame.get("kind") == "error":
             raise _deserialize_openai_error(frame["error"])
+        content_text, reasoning_text = _filter_chat_text(frame["text"], mode=prompt_mode)
         backend_finished_at = time.perf_counter()
         response_built_at = time.perf_counter()
         processing_s = backend_finished_at - submit_started_at
@@ -5566,11 +6032,11 @@ def create_queue_frontend_aiohttp_app(
                 "id": completion_id,
                 "object": "chat.completion",
                 "created": created_at,
-                "model": state.model_id,
+                "model": response_model,
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": frame["text"]},
+                        "message": _assistant_message_payload(content_text, reasoning_text),
                         "finish_reason": frame["finish_reason"],
                     }
                 ],
@@ -5608,6 +6074,7 @@ async def _run_queue_frontend_aiohttp_async(
     request_queue: Any,
     response_queue: Any,
     public_socket: socket.socket,
+    frontend_ready_event: Any | None = None,
 ):
     app = create_queue_frontend_aiohttp_app(
         model_id=model_id,
@@ -5621,6 +6088,7 @@ async def _run_queue_frontend_aiohttp_async(
     await runner.setup()
     site = web.SockSite(runner, public_socket)
     await site.start()
+    _set_ready_event(frontend_ready_event)
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signame in ("SIGINT", "SIGTERM"):
@@ -5651,6 +6119,8 @@ def _run_queue_frontend_process(
     access_log: bool,
     backlog: int,
     timeout_keep_alive: int,
+    disable_cors: bool,
+    frontend_ready_event: Any | None = None,
 ):
     if frontend_http_stack == "aiohttp":
         _enable_uvloop()
@@ -5663,6 +6133,7 @@ def _run_queue_frontend_process(
                 request_queue=request_queue,
                 response_queue=response_queue,
                 public_socket=public_socket,
+                frontend_ready_event=frontend_ready_event,
             )
         )
         return
@@ -5673,6 +6144,7 @@ def _run_queue_frontend_process(
         frontend_id=frontend_id,
         request_queue=request_queue,
         response_queue=response_queue,
+        disable_cors=disable_cors,
     )
     _run_uvicorn_server(
         app,
@@ -5684,6 +6156,7 @@ def _run_queue_frontend_process(
         backlog=backlog,
         timeout_keep_alive=timeout_keep_alive,
         sockets=[public_socket],
+        ready_callback=(lambda: _set_ready_event(frontend_ready_event)) if frontend_ready_event is not None else None,
     )
 
 
@@ -5696,6 +6169,7 @@ def _run_queue_cluster(args, llm_kwargs: dict[str, Any]):
     request_queues = [ctx.SimpleQueue() for _ in range(args.frontend_workers)]
     response_queues = [ctx.SimpleQueue() for _ in range(args.frontend_workers)]
     backend_ready = ctx.Event()
+    frontend_ready = ctx.Event()
     public_sockets = _create_reuse_port_sockets(
         args.host,
         args.port,
@@ -5739,6 +6213,8 @@ def _run_queue_cluster(args, llm_kwargs: dict[str, Any]):
                     "access_log": args.access_log,
                     "backlog": args.backlog,
                     "timeout_keep_alive": args.timeout_keep_alive,
+                    "disable_cors": args.disable_cors,
+                    "frontend_ready_event": frontend_ready,
                 },
                 daemon=True,
             )
@@ -5746,6 +6222,8 @@ def _run_queue_cluster(args, llm_kwargs: dict[str, Any]):
             children.append(proc)
         for sock in public_sockets:
             sock.close()
+        _wait_for_frontend_ready(frontend_ready, children)
+        _print_public_ready_banner(args.host, args.port)
         while True:
             for proc in children:
                 proc.join(timeout=0.2)
@@ -5813,6 +6291,7 @@ def _run_ipc_cluster(args, llm_kwargs: dict[str, Any]):
         os.remove(backend_uds)
     model_id = args.served_model_name or _default_model_name(args.model)
     created = int(time.time())
+    frontend_ready = ctx.Event()
     public_sockets = _create_reuse_port_sockets(
         args.host,
         args.port,
@@ -5850,6 +6329,8 @@ def _run_ipc_cluster(args, llm_kwargs: dict[str, Any]):
                     "access_log": args.access_log,
                     "backlog": args.backlog,
                     "timeout_keep_alive": args.timeout_keep_alive,
+                    "disable_cors": args.disable_cors,
+                    "frontend_ready_event": frontend_ready,
                 },
                 daemon=True,
             )
@@ -5857,6 +6338,8 @@ def _run_ipc_cluster(args, llm_kwargs: dict[str, Any]):
             children.append(proc)
         for sock in public_sockets:
             sock.close()
+        _wait_for_frontend_ready(frontend_ready, children)
+        _print_public_ready_banner(args.host, args.port)
         while True:
             for proc in children:
                 proc.join(timeout=0.2)
@@ -5920,6 +6403,7 @@ def build_arg_parser():
     parser.add_argument("--proxy-backend-max-connections", type=int, default=256)
     parser.add_argument("--proxy-backend-keepalive-connections", type=int, default=256)
     parser.add_argument("--api-key", default=None)
+    parser.add_argument("--disable-cors", action="store_true")
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
     parser.add_argument("--max-num-seqs", type=int, default=512)
@@ -5949,17 +6433,45 @@ def _uvicorn_config(
     backlog: int,
     timeout_keep_alive: int,
 ) -> uvicorn.Config:
+    loop_name = "uvloop" if uvloop is not None else "asyncio"
     return uvicorn.Config(
         app,
         host=host or "127.0.0.1",
         port=port or 8000,
         uds=uds,
-        loop="uvloop",
+        loop=loop_name,
         http="httptools",
         log_level=log_level,
         access_log=access_log,
         backlog=backlog,
         timeout_keep_alive=timeout_keep_alive,
+    )
+
+
+def _create_uvicorn_server(
+    app: FastAPI,
+    *,
+    host: str | None,
+    port: int | None,
+    uds: str | None,
+    log_level: str,
+    access_log: bool,
+    backlog: int,
+    timeout_keep_alive: int,
+    ready_callback: Callable[[], None] | None = None,
+) -> uvicorn.Server:
+    return _ReadyAwareUvicornServer(
+        _uvicorn_config(
+            app,
+            host=host,
+            port=port,
+            uds=uds,
+            log_level=log_level,
+            access_log=access_log,
+            backlog=backlog,
+            timeout_keep_alive=timeout_keep_alive,
+        ),
+        ready_callback=ready_callback,
     )
 
 
@@ -5974,18 +6486,18 @@ def _run_uvicorn_server(
     backlog: int,
     timeout_keep_alive: int,
     sockets: list[socket.socket] | None = None,
+    ready_callback: Callable[[], None] | None = None,
 ):
-    server = uvicorn.Server(
-        _uvicorn_config(
-            app,
-            host=host,
-            port=port,
-            uds=uds,
-            log_level=log_level,
-            access_log=access_log,
-            backlog=backlog,
-            timeout_keep_alive=timeout_keep_alive,
-        )
+    server = _create_uvicorn_server(
+        app,
+        host=host,
+        port=port,
+        uds=uds,
+        log_level=log_level,
+        access_log=access_log,
+        backlog=backlog,
+        timeout_keep_alive=timeout_keep_alive,
+        ready_callback=ready_callback,
     )
     server.run(sockets=sockets)
 
@@ -6060,6 +6572,7 @@ def _run_frontend_process(
     timeout_keep_alive: int,
     backend_max_connections: int,
     backend_keepalive_connections: int,
+    frontend_ready_event: Any | None = None,
 ):
     app = create_proxy_app(
         backend_uds=backend_uds,
@@ -6076,6 +6589,7 @@ def _run_frontend_process(
         backlog=backlog,
         timeout_keep_alive=timeout_keep_alive,
         sockets=[public_socket],
+        ready_callback=(lambda: _set_ready_event(frontend_ready_event)) if frontend_ready_event is not None else None,
     )
 
 
@@ -6094,6 +6608,19 @@ def _wait_for_backend(backend_uds: str, timeout_s: float = 120.0):
     raise RuntimeError(f"Timed out waiting for backend to become ready on uds={backend_uds}")
 
 
+def _wait_for_frontend_ready(frontend_ready_event: Any, children: list[mp.Process], timeout_s: float = 120.0):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if frontend_ready_event.wait(timeout=0.1):
+            return
+        for proc in children:
+            if not proc.is_alive():
+                raise RuntimeError(
+                    f"Frontend process exited before becoming ready (pid={proc.pid}, exitcode={proc.exitcode})."
+                )
+    raise RuntimeError("Timed out waiting for public frontend to become ready.")
+
+
 def _run_proxy_cluster(args, llm_kwargs: dict[str, Any]):
     if os.name != "posix":
         raise RuntimeError("frontend proxy workers require a POSIX platform.")
@@ -6102,6 +6629,7 @@ def _run_proxy_cluster(args, llm_kwargs: dict[str, Any]):
     if os.path.exists(backend_uds):
         os.remove(backend_uds)
     public_socket = _create_listening_socket(args.host, args.port, args.backlog)
+    frontend_ready = ctx.Event()
     children: list[mp.Process] = []
     try:
         backend = ctx.Process(
@@ -6133,11 +6661,14 @@ def _run_proxy_cluster(args, llm_kwargs: dict[str, Any]):
                     "timeout_keep_alive": args.timeout_keep_alive,
                     "backend_max_connections": args.proxy_backend_max_connections,
                     "backend_keepalive_connections": args.proxy_backend_keepalive_connections,
+                    "frontend_ready_event": frontend_ready,
                 },
                 daemon=True,
             )
             proc.start()
             children.append(proc)
+        _wait_for_frontend_ready(frontend_ready, children)
+        _print_public_ready_banner(args.host, args.port)
         while True:
             for proc in children:
                 proc.join(timeout=0.2)
@@ -6168,6 +6699,7 @@ def _run_listener_threads(args, llm_kwargs: dict[str, Any]):
     if shared_state.batcher is not None:
         shared_state.batcher.start()
     sockets = _create_reuse_port_sockets(args.host, args.port, args.backlog, args.listener_threads)
+    announce_ready = _make_once_callback(lambda: _print_public_ready_banner(args.host, args.port))
     servers: list[uvicorn.Server] = []
     threads: list[threading.Thread] = []
     try:
@@ -6179,18 +6711,18 @@ def _run_listener_threads(args, llm_kwargs: dict[str, Any]):
                 llm_kwargs=None,
                 server_state=shared_state,
                 manage_resources=False,
+                disable_cors=args.disable_cors,
             )
-            server = uvicorn.Server(
-                _uvicorn_config(
-                    app,
-                    host=None,
-                    port=None,
-                    uds=None,
-                    log_level=args.log_level,
-                    access_log=args.access_log,
-                    backlog=args.backlog,
-                    timeout_keep_alive=args.timeout_keep_alive,
-                )
+            server = _create_uvicorn_server(
+                app,
+                host=None,
+                port=None,
+                uds=None,
+                log_level=args.log_level,
+                access_log=args.access_log,
+                backlog=args.backlog,
+                timeout_keep_alive=args.timeout_keep_alive,
+                ready_callback=announce_ready,
             )
             thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
             thread.start()
@@ -6280,6 +6812,7 @@ def main():
         served_model_name=args.served_model_name,
         api_key=args.api_key,
         llm_kwargs=llm_kwargs,
+        disable_cors=args.disable_cors,
     )
     _run_uvicorn_server(
         app,
@@ -6290,6 +6823,7 @@ def main():
         access_log=args.access_log,
         backlog=args.backlog,
         timeout_keep_alive=args.timeout_keep_alive,
+        ready_callback=lambda: _print_public_ready_banner(args.host, args.port),
     )
 
 

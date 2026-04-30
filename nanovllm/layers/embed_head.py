@@ -19,6 +19,18 @@ def _gather_logits(logits: torch.Tensor, tp_size: int, tp_rank: int):
     return torch.cat(all_logits, -1) if tp_rank == 0 else None
 
 
+def _tp_rank() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    return 0
+
+
+def _tp_size() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    return 1
+
+
 class VocabParallelEmbedding(nn.Module):
 
     def __init__(
@@ -27,8 +39,8 @@ class VocabParallelEmbedding(nn.Module):
         embedding_dim: int,
     ):
         super().__init__()
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        self.tp_rank = _tp_rank()
+        self.tp_size = _tp_size()
         assert num_embeddings % self.tp_size == 0
         self.num_embeddings = num_embeddings
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size

@@ -171,7 +171,7 @@ class OpenAIAPIAsyncSDKCompatTest(unittest.TestCase):
         self.assertEqual(completion.model, "rwkv-test")
         self.assertEqual(completion.choices[0].message.content, "CHAT")
         self.assertEqual(completion.choices[0].finish_reason, "stop")
-        self.assertEqual(completion.usage.prompt_tokens, len("User: hello\nAssistant:"))
+        self.assertEqual(completion.usage.prompt_tokens, len("User: hello\n\nAssistant: <think>\n</think>\n"))
         self.assertEqual(completion.usage.completion_tokens, 4)
 
 

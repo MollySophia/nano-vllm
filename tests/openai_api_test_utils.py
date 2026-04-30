@@ -230,6 +230,7 @@ def patched_app(
     served_model_name: str = "rwkv-test",
     api_key: str | None = None,
     llm_kwargs: dict | None = None,
+    disable_cors: bool = False,
     **fake_llm_kwargs,
 ):
     factory = FakeLLMFactory(**fake_llm_kwargs)
@@ -239,6 +240,7 @@ def patched_app(
             served_model_name=served_model_name,
             api_key=api_key,
             llm_kwargs=llm_kwargs,
+            disable_cors=disable_cors,
         )
     try:
         yield app, factory.instances[0], factory

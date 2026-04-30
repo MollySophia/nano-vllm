@@ -18,6 +18,20 @@ class OpenAIAPIEndpointsTest(unittest.TestCase):
         if IMPORT_ERROR is not None:
             raise unittest.SkipTest(f"OpenAI API test dependencies unavailable: {IMPORT_ERROR}")
 
+    def test_disable_cors_allows_wildcard_preflight(self):
+        with patched_test_client(disable_cors=True) as (client, _llm, _factory):
+            response = client.options(
+                "/v1/chat/completions",
+                headers={
+                    "Origin": "http://localhost:3000",
+                    "Access-Control-Request-Method": "POST",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["access-control-allow-origin"], "*")
+        self.assertIn("POST", response.headers["access-control-allow-methods"])
+
     def test_health_endpoint_is_public(self):
         with patched_test_client(api_key="secret") as (client, llm, _factory):
             response = client.get("/health")
@@ -30,15 +44,18 @@ class OpenAIAPIEndpointsTest(unittest.TestCase):
         with patched_test_client(api_key="secret") as (client, _llm, _factory):
             unauthorized = client.get("/v1/models")
             listed = client.get("/v1/models", headers={"Authorization": "Bearer secret"})
-            retrieved = client.get("/v1/models/rwkv-test", headers={"Authorization": "Bearer secret"})
+            retrieved = client.get("/v1/models/rwkv-test:thinking", headers={"Authorization": "Bearer secret"})
 
         self.assertEqual(unauthorized.status_code, 401)
         self.assertEqual(unauthorized.json()["error"]["code"], "invalid_api_key")
         self.assertEqual(listed.status_code, 200)
         self.assertEqual(listed.json()["object"], "list")
-        self.assertEqual(listed.json()["data"][0]["id"], "rwkv-test")
+        self.assertEqual(
+            [item["id"] for item in listed.json()["data"]],
+            ["rwkv-test", "rwkv-test:thinking", "rwkv-test:raw"],
+        )
         self.assertEqual(retrieved.status_code, 200)
-        self.assertEqual(retrieved.json()["id"], "rwkv-test")
+        self.assertEqual(retrieved.json()["id"], "rwkv-test:thinking")
         self.assertEqual(retrieved.json()["owned_by"], "nano-vllm")
 
     def test_sync_completion_returns_expected_shape_usage_and_headers(self):
@@ -74,6 +91,21 @@ class OpenAIAPIEndpointsTest(unittest.TestCase):
         self.assertEqual(request["sampling_params"].top_p, 0.9)
         self.assertEqual(request["sampling_params"].max_tokens, 5)
         self.assertEqual(factory.calls[0][0], "/models/rwkv-test.pth")
+
+    def test_sync_completion_accepts_model_alias_without_rewriting_prompt(self):
+        with patched_test_client(completion_text="OK") as (client, llm, _factory):
+            response = client.post(
+                "/v1/completions",
+                json={
+                    "model": "rwkv-test:thinking",
+                    "prompt": "abc",
+                    "max_tokens": 2,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["model"], "rwkv-test:thinking")
+        self.assertEqual(llm.received_requests[0]["prompt_text"], "abc")
 
     def test_sync_completion_maps_openai_penalties_to_internal_sampling_params(self):
         with patched_test_client(completion_text="OK") as (client, llm, _factory):
@@ -139,9 +171,39 @@ class OpenAIAPIEndpointsTest(unittest.TestCase):
         self.assertEqual(body["usage"]["completion_tokens"], 2)
         self.assertEqual(
             llm.received_requests[0]["prompt_text"],
-            "System: Be terse.\nUser: Hello world\nAssistant:",
+            "System: Be terse.\nUser: Hello world\n\nAssistant: <think>\n</think>\n",
         )
         self.assertEqual(llm.received_requests[0]["sampling_params"].max_tokens, 2)
+
+    def test_sync_chat_completion_model_thinking_suffix_uses_open_think_prompt(self):
+        with patched_test_client(chat_text="OK") as (client, llm, _factory):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "rwkv-test:thinking",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 4,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["model"], "rwkv-test:thinking")
+        self.assertEqual(llm.received_requests[0]["prompt_text"], "User: Hello\n\nAssistant: <think")
+
+    def test_sync_chat_completion_model_raw_suffix_uses_plain_assistant_prompt(self):
+        with patched_test_client(chat_text="OK") as (client, llm, _factory):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "rwkv-test:raw",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 4,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["model"], "rwkv-test:raw")
+        self.assertEqual(llm.received_requests[0]["prompt_text"], "User: Hello\n\nAssistant:")
 
     def test_sync_chat_completion_uses_tokenizer_chat_template_when_available(self):
         tokenizer = FakeTemplateTokenizer(template_text="<CHAT> templated prompt")
@@ -157,10 +219,52 @@ class OpenAIAPIEndpointsTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["choices"][0]["message"]["content"], "OK")
-        self.assertEqual(llm.received_requests[0]["prompt_text"], "<CHAT> templated prompt")
+        self.assertEqual(llm.received_requests[0]["prompt_text"], "<CHAT> templated prompt\n\nAssistant: <think>\n</think>\n")
         self.assertEqual(
             tokenizer.calls,
-            [([{"role": "user", "content": "Hello"}], False, True)],
+            [([{"role": "user", "content": "Hello"}], False, False)],
+        )
+
+    def test_sync_chat_completion_returns_reasoning_content_with_markdown_restored(self):
+        with patched_test_client(chat_text="<think>## plan\nstep 2</think>## answer\nline 2") as (client, _llm, _factory):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "rwkv-test",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 64,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["choices"][0]["message"],
+            {
+                "role": "assistant",
+                "content": "## answer\n\nline 2",
+                "reasoning_content": "## plan\n\nstep 2",
+            },
+        )
+
+    def test_sync_chat_completion_thinking_suffix_starts_parser_in_reasoning_mode(self):
+        with patched_test_client(chat_text="## plan\nstep 2</think>## answer\nline 2") as (client, _llm, _factory):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "rwkv-test:thinking",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 64,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["choices"][0]["message"],
+            {
+                "role": "assistant",
+                "content": "## answer\n\nline 2",
+                "reasoning_content": "## plan\n\nstep 2",
+            },
         )
 
     def test_lightning_private_v1_batch_uses_contents_shape(self):
