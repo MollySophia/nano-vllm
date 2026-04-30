@@ -12,8 +12,32 @@ benchmarking.
 ## Install
 
 ```bash
+uv venv
+source .venv/bin/activate
+```
+
+Use `uv sync --extra ...` to select the Torch build for your platform:
+
+```bash
+uv sync --extra torch-cu130
+uv sync --extra torch-cu126
+uv sync --extra torch-cpu
+uv sync --extra torch-rocm
+```
+
+If you just want an editable install without syncing extras:
+
+```bash
+uv pip install -e .
+```
+
+Legacy pip path:
+
+```bash
 pip install -e .
 ```
+> [!TIP]
+> On Windows, the recommended setup is to run nano-vLLM inside WSL2.
 
 Use the local `nanovllm` conda environment when running on Molly's machine:
 
